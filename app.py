@@ -545,6 +545,10 @@ with tab4:
                         'Vt': fo4c['Vy'], 'Vl': fo4c['Vx'], 'T':  fo4c['T'],
                     })
 
+            # ---- Debug: show raw check_pts before filtering ----
+            with st.expander("🔍 Debug: raw check points (expand if results are empty)"):
+                st.dataframe(pd.DataFrame(check_pts), use_container_width=True, hide_index=True)
+            
             results4 = []
             for cp in check_pts:
                 if not cp['D'] or not cp['t'] or cp['t'] <= 0:
