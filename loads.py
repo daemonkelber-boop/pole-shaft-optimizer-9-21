@@ -146,27 +146,23 @@ class Baseline:
                   get_single_table(p, 'tubular_davit_arm_connectivity')} \
             if 'tubular_davit_arm_connectivity' in p['tables'] else {}
 
-        def resolve(label: str) -> Tuple[float, float, float, float]:
-    if label in pole_s:
-        return pole_s[label], 0.0, 0.0, 0.0
-    davit, _, jt = label.partition(':')
-    if davit not in davits:
-        # Label not found in pole joints or davit table —
-        # treat as a direct pole attachment at tip (s=0) and flag it.
-        import warnings
-        warnings.warn(f"resolve(): label '{label}' not found in pole joints "
-                      f"or davit table — defaulting to tip (s=0). "
-                      f"Check vang/attachment connectivity in the XML.")
-        return 0.0, 0.0, 0.0, 0.0
-    d = davits[davit]
+                def resolve(label: str) -> Tuple[float, float, float, float]:
+            if label in pole_s:
+                return pole_s[label], 0.0, 0.0, 0.0
+            davit, _, jt = label.partition(':')
+            if davit not in davits:
+                import warnings
+                warnings.warn(f"resolve(): label '{label}' not found in pole joints "
+                              f"or davit table — defaulting to tip (s=0). "
+                              f"Check vang/attachment connectivity in the XML.")
+                return 0.0, 0.0, 0.0, 0.0
+            d = davits[davit]
             s, h, dz, az = resolve(d['attach_label'])
             if h == 0.0 and dz == 0.0:
                 az = g(d, 'azimuth')
             if jt in ('O', ''):
                 return s, h, dz, az
             dh, dv = dprops[d['davit_property_set']][jt]
-            # PLS davit 'vert_offset' is positive DOWNWARD (verified on 003:
-            # DA1 tip at vert_offset -0.5 sits 0.5 ft ABOVE the arm origin).
             return s, h + dh, dz - dv, az
 
         attach = {}
