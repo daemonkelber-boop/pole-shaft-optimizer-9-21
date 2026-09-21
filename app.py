@@ -1,14 +1,16 @@
 import streamlit as st
-import tempfile, os
+import tempfile, os, hashlib, traceback
 import pandas as pd
-import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 st.set_page_config(page_title="Pole Shaft Optimizer", layout="wide")
 st.title("🗼 Pole Shaft Optimizer")
 st.caption("ASCE 48-19 | 12-sided tapered polygonal steel poles")
 
-# ── SINGLE XML UPLOAD (sidebar) ────────────────────────────────────────────
+# ── SIDEBAR: upload + analysis settings ────────────────────────────────────
 with st.sidebar:
     st.header("📂 Upload XML")
     uploaded = st.file_uploader("PLS-POLE XML export", type=["xml"])
@@ -17,49 +19,79 @@ with st.sidebar:
     else:
         st.info("Upload a file to begin.")
 
-tmp_path = None
-if uploaded:
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xml")
-    tmp.write(uploaded.read())
-    tmp.flush()
-    tmp_path = tmp.name
-    tmp.close()
+    st.header("⚙️ Analysis settings")
+    br_label = st.radio("Inside bend radius", ["4.5t (matches PLS-POLE)", "4.0t (ASCE 48-19 cap)"],
+                        index=0, help="Used for flat width w and w/t -> local buckling Fa.")
+    BR = 4.5 if br_label.startswith("4.5") else 4.0
+    SHEAR = st.radio("Shear for stress check", ["resultant", "transverse_only"], index=0,
+                     help="Shear direction used at the perimeter points. Identical on "
+                          "tangent structures with no longitudinal load.")
+    LAP = st.radio("Slip-joint lap stiffness (deflection)", ["outer", "inner", "sum"], index=0,
+                   help="outer = female tube only (default, validated on 003 to +0.3%); "
+                        "inner = male only; sum = both walls composite.")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📂 1 · XML Parser",
-    "📐 2 · Geometry & Weight",
-    "💨 3 · Loads",
-    "🔩 4 · Strength Check",
-    "⚖️ 5 · Optimizer",
-])
+# ── Cached helpers ─────────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def save_xml(data: bytes) -> str:
+    h = hashlib.md5(data).hexdigest()
+    path = os.path.join(tempfile.gettempdir(), f"pls_{h}.xml")
+    if not os.path.exists(path):
+        with open(path, "wb") as f:
+            f.write(data)
+    return path
 
-# ── SHARED HELPER: build PoleSpec from parsed XML ──────────────────────────
-def build_spec(p, gf, gst):
+@st.cache_resource(show_spinner=False)
+def load_parsed(path):
+    from pls_pole_xml_parser import parse_pls_pole_xml
+    return parse_pls_pole_xml(path)
+
+@st.cache_resource(show_spinner=False)
+def load_baseline(path):
+    from loads import Baseline
+    return Baseline.from_xml(path)
+
+def build_spec(p):
+    from pls_pole_xml_parser import get_field as gf, get_single_table as gst
     from geometry import PoleSpec, Segment
     prop  = gst(p, 'steel_pole_properties')[0]
     tubes = gst(p, 'steel_tubes_properties')
     conn  = gst(p, 'steel_pole_connectivity')
     is_bp = str(prop.get('base_plate', '')).lower() == 'yes'
-    emb   = 0.0
+    emb = 0.0
     if not is_bp and conn:
-        emb = gf(conn[0], 'embed_override') or \
-              gf(prop, 'default_embedded_length') or 0.0
+        emb = gf(conn[0], 'embed_override') or gf(prop, 'default_embedded_length') or 0.0
     segs = []
     for t in tubes:
         lap = gf(t, 'lap_length') or 0.0
-        segs.append(Segment(
-            length=gf(t, 'length'),
-            thickness=gf(t, 'thickness'),
-            fy=gf(t, 'yield_stress') or 65.0,
-            joint_type='slip' if lap > 0 else 'flange',
-        ))
-    return PoleSpec(
-        label=prop.get('steel_pole_property_label', ''),
-        tip_diameter=gf(prop, 'tip_diameter'),
-        taper=gf(tubes[0], 'calculated_taper'),
-        segments=segs,
-        embedment=emb,
-    )
+        segs.append(Segment(length=gf(t, 'length'), thickness=gf(t, 'thickness'),
+                            fy=gf(t, 'yield_stress') or 65.0,
+                            joint_type='slip' if lap > 0 else 'flange'))
+    return PoleSpec(label=prop.get('steel_pole_property_label', ''),
+                    tip_diameter=gf(prop, 'tip_diameter'),
+                    taper=gf(tubes[0], 'calculated_taper'),
+                    segments=segs, embedment=emb)
+
+@st.cache_resource(show_spinner=False)
+def run_candidate(path, br, shear, lap):
+    from strength import evaluate_candidate
+    p = load_parsed(path)
+    return evaluate_candidate(build_spec(p), load_baseline(path),
+                              bend_radius_factor=br, shear_mode=shear,
+                              lap_stiffness=lap, spacing=1.0)
+
+def show_error(e):
+    st.error(f"Error: {e}")
+    st.code(traceback.format_exc())
+
+def gov_index(cases, name):
+    return cases.index(name) if name in cases else 0
+
+tmp_path = save_xml(uploaded.getvalue()) if uploaded else None
+
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "📂 1 · XML Parser", "📐 2 · Geometry & Weight", "💨 3 · Loads",
+    "🔩 4 · Strength Check", "📏 5 · Deflection", "⚖️ 6 · Optimizer",
+])
 
 # ── TAB 1: XML PARSER ──────────────────────────────────────────────────────
 with tab1:
@@ -68,11 +100,8 @@ with tab1:
         st.info("Upload a PLS-POLE XML file in the sidebar to begin.")
     else:
         try:
-            from pls_pole_xml_parser import (
-                parse_pls_pole_xml, get_single_table, get_field,
-                LOAD_CASE_TAGNAMES
-            )
-            p = parse_pls_pole_xml(tmp_path)
+            from pls_pole_xml_parser import get_single_table, get_field, LOAD_CASE_TAGNAMES
+            p = load_parsed(tmp_path)
 
             st.subheader("File metadata")
             st.json(p['creator'])
@@ -83,13 +112,10 @@ with tab1:
                 kind = ("per-load-case" if tagname in LOAD_CASE_TAGNAMES
                         else "repeated" if any(i['titledetail'] for i in instances)
                         else "single")
-                inv.append({
-                    "table":      tagname,
-                    "instances":  len(instances),
-                    "total rows": sum(i['nrows_actual'] for i in instances),
-                    "kind":       kind,
-                })
-            st.dataframe(pd.DataFrame(inv), use_container_width=True, hide_index=True)
+                inv.append({"table": tagname, "instances": len(instances),
+                            "total rows": sum(i['nrows_actual'] for i in instances),
+                            "kind": kind})
+            st.dataframe(pd.DataFrame(inv), width="stretch", hide_index=True)
 
             st.subheader("Pole properties")
             prop1 = get_single_table(p, 'steel_pole_properties')
@@ -99,43 +125,37 @@ with tab1:
             st.subheader("Tube properties")
             tubes1 = get_single_table(p, 'steel_tubes_properties')
             if tubes1:
-                tr = []
-                for t in tubes1:
-                    tr.append({
-                        "tube #":         get_field(t, 'tube_no'),
-                        "length (ft)":    get_field(t, 'length'),
-                        "thickness (in)": get_field(t, 'thickness'),
-                        "D top (in)":     get_field(t, 'tube_top_diameter'),
-                        "D bot (in)":     get_field(t, 'tube_bot_diameter'),
-                        "taper (in/ft)":  get_field(t, 'calculated_taper'),
-                        "lap (ft)":       get_field(t, 'lap_length') or 0.0,
-                        "weight (lb)":    get_field(t, 'tube_weight'),
-                        "Fy (ksi)":       get_field(t, 'yield_stress'),
-                    })
-                st.dataframe(pd.DataFrame(tr), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame([{
+                    "tube #": get_field(t, 'tube_no'),
+                    "length (ft)": get_field(t, 'length'),
+                    "thickness (in)": get_field(t, 'thickness'),
+                    "D top (in)": get_field(t, 'tube_top_diameter'),
+                    "D bot (in)": get_field(t, 'tube_bot_diameter'),
+                    "taper (in/ft)": get_field(t, 'calculated_taper'),
+                    "lap (ft)": get_field(t, 'lap_length') or 0.0,
+                    "weight (lb)": get_field(t, 'tube_weight'),
+                    "Fy (ksi)": get_field(t, 'yield_stress'),
+                } for t in tubes1]), width="stretch", hide_index=True)
 
             st.subheader("Load cases")
             lcs1 = get_single_table(p, 'vector_load_cases')
             if lcs1:
-                lcr = []
-                for r in lcs1:
-                    lcr.append({
-                        "load case":     r.get('load_case_description'),
-                        "DLF":           get_field(r, 'dead_load_factor'),
-                        "q_trans (psf)": get_field(r, 'trans_wind_pressure'),
-                        "q_long (psf)":  get_field(r, 'longit_wind_pressure'),
-                        "ice t (in)":    get_field(r, 'ice_thick') or 0.0,
-                    })
-                st.dataframe(pd.DataFrame(lcr), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame([{
+                    "load case": r.get('load_case_description'),
+                    "DLF": get_field(r, 'dead_load_factor'),
+                    "q_trans (psf)": get_field(r, 'trans_wind_pressure'),
+                    "q_long (psf)": get_field(r, 'longit_wind_pressure'),
+                    "ice t (in)": get_field(r, 'ice_thick') or 0.0,
+                    "defl check": r.get('pole_deflection_check'),
+                    "defl limit": get_field(r, 'pole_deflection_limit_or'),
+                } for r in lcs1]), width="stretch", hide_index=True)
 
             st.subheader("Governing usage summary")
             summ1 = get_single_table(p, 'summary_of_steel_pole_usages')
             if summ1:
                 st.json({k: v for k, v in summ1[0].items()})
-
         except Exception as e:
-            st.error(f"Error: {e}")
-            import traceback; st.code(traceback.format_exc())
+            show_error(e)
 
 # ── TAB 2: GEOMETRY & WEIGHT ───────────────────────────────────────────────
 with tab2:
@@ -144,114 +164,92 @@ with tab2:
         st.info("Upload a PLS-POLE XML file in the sidebar to begin.")
     else:
         try:
-            from pls_pole_xml_parser import (
-                parse_pls_pole_xml as _p2, get_single_table as _gst2,
-                get_field as _gf2
-            )
             from geometry import DesignLimits, build_sections, validate, describe
             from weight import pole_weight
 
-            p2   = _p2(tmp_path)
-            spec2 = build_spec(p2, _gf2, _gst2)
-            limits = DesignLimits()
-            lay2   = spec2.layout()
-            secs2  = build_sections(spec2, spacing=5.0)
-            hgts2  = [spec2.groundline_rel - s['rel_dist'] for s in secs2]
+            spec2 = build_spec(load_parsed(tmp_path))
+            limits = DesignLimits(bend_radius_factor=BR)
+            lay2 = spec2.layout()
 
             st.subheader("Pole summary")
             c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("Total length", f"{spec2.total_length:.2f} ft")
-            c2.metric("AGL height",   f"{spec2.agl_height:.2f} ft")
-            c3.metric("Tip D",        f"{spec2.tip_diameter:.2f} in")
-            c4.metric("Base D",       f"{spec2.base_diameter:.2f} in")
-            c5.metric("Taper",        f"{spec2.taper:.5f} in/ft")
+            c2.metric("AGL height", f"{spec2.agl_height:.2f} ft")
+            c3.metric("Tip D", f"{spec2.tip_diameter:.2f} in")
+            c4.metric("Base D", f"{spec2.base_diameter:.2f} in")
+            c5.metric("Taper", f"{spec2.taper:.5f} in/ft")
 
             st.subheader("Tube layout")
             st.dataframe(pd.DataFrame([{
-                "tube #":         tb['tube_no'],
-                "start (ft)":     round(tb['start'], 3),
-                "end (ft)":       round(tb['end'], 3),
-                "length (ft)":    round(tb['length'], 3),
-                "thickness (in)": tb['thickness'],
-                "D top (in)":     round(tb['d_top'], 3),
-                "D bot (in)":     round(tb['d_bot'], 3),
-                "joint":          tb['joint_type'],
-                "lap (ft)":       round(tb['lap'], 3),
-            } for tb in lay2]), use_container_width=True, hide_index=True)
+                "tube #": tb['tube_no'], "start (ft)": round(tb['start'], 3),
+                "end (ft)": round(tb['end'], 3), "length (ft)": round(tb['length'], 3),
+                "thickness (in)": tb['thickness'], "D top (in)": round(tb['d_top'], 3),
+                "D bot (in)": round(tb['d_bot'], 3), "joint": tb['joint_type'],
+                "lap (ft)": round(tb['lap'], 3),
+            } for tb in lay2]), width="stretch", hide_index=True)
 
             st.subheader("Weight breakdown")
             w2 = pole_weight(spec2)
             wc1, wc2, wc3 = st.columns(3)
             wc1.metric("Total shaft weight", f"{w2['total_weight']:,.0f} lb")
-            wc2.metric("Above ground",       f"{w2['above_ground_weight']:,.0f} lb")
-            wc3.metric("Embedded steel",     f"{w2['embedded_weight']:,.0f} lb")
+            wc2.metric("Above ground", f"{w2['above_ground_weight']:,.0f} lb")
+            wc3.metric("Embedded steel", f"{w2['embedded_weight']:,.0f} lb")
             st.dataframe(pd.DataFrame([{
-                "tube #":         pt['tube_no'],
-                "length (ft)":    round(pt['length'], 3),
-                "thickness (in)": pt['thickness'],
-                "D top (in)":     round(pt['d_top'], 3),
-                "D bot (in)":     round(pt['d_bot'], 3),
-                "lap (ft)":       round(pt['lap'], 3),
-                "weight (lb)":    round(pt['weight'], 1),
-            } for pt in w2['per_tube']]), use_container_width=True, hide_index=True)
+                "tube #": pt['tube_no'], "length (ft)": round(pt['length'], 3),
+                "thickness (in)": pt['thickness'], "D top (in)": round(pt['d_top'], 3),
+                "D bot (in)": round(pt['d_bot'], 3), "lap (ft)": round(pt['lap'], 3),
+                "weight (lb)": round(pt['weight'], 1),
+            } for pt in w2['per_tube']]), width="stretch", hide_index=True)
 
             st.subheader("Section properties table")
             spacing_val = st.slider("Section spacing (ft)", 1.0, 10.0, 5.0, 0.5)
-            secs2s = build_sections(spec2, spacing=spacing_val)
+            secs2 = build_sections(spec2, spacing=spacing_val, bend_radius_factor=BR)
+            st.caption(f"w/t computed with inside bend radius = {BR}t")
             st.dataframe(pd.DataFrame([{
-                "rel_dist (ft)": round(s['rel_dist'], 3),
-                "ht AGL (ft)":   round(s['height_agl'], 3),
-                "tube #":        s['tube_no'],
-                "in lap":        s['in_lap'],
-                "D (in)":        round(s['D'], 3),
-                "t (in)":        s['t'],
-                "w/t":           round(s['w_over_t'], 2),
-                "Ag (in²)":      round(s['Ag'], 3),
-                "I (in⁴)":       round(s['I'], 1),
-                "C (in)":        round(s['C'], 3),
-                "S (in³)":       round(s['S'], 3),
-                "below GL":      s['below_groundline'],
-            } for s in secs2s]), use_container_width=True, hide_index=True)
+                "rel_dist (ft)": round(s['rel_dist'], 3), "ht AGL (ft)": round(s['height_agl'], 3),
+                "tube #": s['tube_no'], "in lap": s['in_lap'], "D (in)": round(s['D'], 3),
+                "t (in)": s['t'], "w/t": round(s['w_over_t'], 2), "Ag (in²)": round(s['Ag'], 3),
+                "I (in⁴)": round(s['I'], 1), "C (in)": round(s['C'], 3),
+                "S (in³)": round(s['S'], 3), "below GL": s['below_groundline'],
+            } for s in secs2]), width="stretch", hide_index=True)
 
-            st.subheader("Diameter profile")
-            fig, ax = plt.subplots(figsize=(7, 5))
-            ax.plot([s['D'] for s in secs2], hgts2, color='steelblue', linewidth=2)
-            ax.axhline(0, color='brown', linestyle='--', linewidth=1, label='Ground line')
-            for tb in lay2:
-                if tb['lap'] > 0:
-                    ax.axhline(spec2.groundline_rel - (tb['end'] - tb['lap']),
-                               color='orange', linestyle=':', linewidth=1,
-                               label='Slip joint' if tb == lay2[0] else '')
-            ax.set_xlabel("Flat-to-flat diameter (in)")
-            ax.set_ylabel("Height above ground line (ft)")
-            ax.set_title("Diameter vs height")
-            ax.legend(); ax.grid(True, alpha=0.3)
-            st.pyplot(fig); plt.close(fig)
-
-            st.subheader("w/t ratio profile")
-            fig2, ax2 = plt.subplots(figsize=(7, 4))
-            ax2.plot([s['w_over_t'] for s in secs2], hgts2, color='darkorange', linewidth=2)
-            ax2.axvline(limits.max_wt, color='red', linestyle='--',
-                        linewidth=1, label=f'Limit = {limits.max_wt}')
-            ax2.axhline(0, color='brown', linestyle='--', linewidth=1, label='Ground line')
-            ax2.set_xlabel("w/t"); ax2.set_ylabel("Height above ground line (ft)")
-            ax2.set_title("w/t vs height")
-            ax2.legend(); ax2.grid(True, alpha=0.3)
-            st.pyplot(fig2); plt.close(fig2)
+            hgts2 = [spec2.groundline_rel - s['rel_dist'] for s in secs2]
+            cA, cB = st.columns(2)
+            with cA:
+                fig, ax = plt.subplots(figsize=(6, 5))
+                ax.plot([s['D'] for s in secs2], hgts2, color='steelblue', linewidth=2)
+                ax.axhline(0, color='brown', linestyle='--', linewidth=1, label='Ground line')
+                first = True
+                for tb in lay2:
+                    if tb['lap'] > 0:
+                        ax.axhspan(spec2.groundline_rel - tb['end'],
+                                   spec2.groundline_rel - (tb['end'] - tb['lap']),
+                                   color='orange', alpha=0.3, label='Slip lap' if first else None)
+                        first = False
+                ax.set_xlabel("Flat-to-flat diameter (in)"); ax.set_ylabel("Height AGL (ft)")
+                ax.set_title("Diameter vs height"); ax.legend(); ax.grid(True, alpha=0.3)
+                st.pyplot(fig); plt.close(fig)
+            with cB:
+                fig2, ax2 = plt.subplots(figsize=(6, 5))
+                ax2.plot([s['w_over_t'] for s in secs2], hgts2, color='darkorange', linewidth=2)
+                ax2.axvline(limits.max_wt, color='red', linestyle='--', linewidth=1,
+                            label=f'Limit = {limits.max_wt}')
+                ax2.axhline(0, color='brown', linestyle='--', linewidth=1, label='Ground line')
+                ax2.set_xlabel(f"w/t (BR = {BR}t)"); ax2.set_ylabel("Height AGL (ft)")
+                ax2.set_title("w/t vs height"); ax2.legend(); ax2.grid(True, alpha=0.3)
+                st.pyplot(fig2); plt.close(fig2)
 
             st.subheader("Geometry constraint check")
             viols = validate(spec2, limits)
             if viols:
-                for v in viols: st.warning(v)
+                for v in viols:
+                    st.warning(v)
             else:
                 st.success("All geometry constraints satisfied.")
-
             with st.expander("Full pole description (text)"):
                 st.text(describe(spec2))
-
         except Exception as e:
-            st.error(f"Error: {e}")
-            import traceback; st.code(traceback.format_exc())
+            show_error(e)
 
 # ── TAB 3: LOAD MODEL ─────────────────────────────────────────────────────
 with tab3:
@@ -260,117 +258,79 @@ with tab3:
         st.info("Upload a PLS-POLE XML file in the sidebar to begin.")
     else:
         try:
-            from pls_pole_xml_parser import (
-                parse_pls_pole_xml as _p3, get_single_table as _gst3,
-                get_field as _gf3
-            )
-            from loads import Baseline, build_load_model, first_order_forces
+            from pls_pole_xml_parser import get_single_table as _gst3
+            from loads import build_load_model, first_order_forces
 
-            p3    = _p3(tmp_path)
-            spec3 = build_spec(p3, _gf3, _gst3)
-            summ3 = _gst3(p3, 'summary_of_steel_pole_usages')[0]
-            base3 = Baseline.from_xml(tmp_path)
-
-            all_cases3  = list(base3.load_cases.keys())
-            gov_case3   = summ3.get('load_case', all_cases3[0])
-            def3_idx    = all_cases3.index(gov_case3) if gov_case3 in all_cases3 else 0
-            sel_case3   = st.selectbox("Load case", all_cases3, index=def3_idx,
-                                       key="lc3",
-                                       help="Defaults to governing case from PLS-POLE summary")
+            p3 = load_parsed(tmp_path)
+            spec3 = build_spec(p3)
+            base3 = load_baseline(tmp_path)
+            gov_case3 = _gst3(p3, 'summary_of_steel_pole_usages')[0].get('load_case')
+            cases3 = list(base3.load_cases.keys())
+            sel_case3 = st.selectbox("Load case", cases3, index=gov_index(cases3, gov_case3),
+                                     key="lc3")
             st.caption(f"Governing case per PLS-POLE: **{gov_case3}**")
 
-            m3  = build_load_model(spec3, base3, sel_case3, ds=0.25)
+            m3 = build_load_model(spec3, base3, sel_case3, ds=0.25)
             lc3 = m3.case
 
             st.subheader("Load case parameters")
-            lp1, lp2, lp3, lp4, lp5 = st.columns(5)
-            lp1.metric("DLF",           f"{lc3.dlf:.2f}")
-            lp2.metric("q trans (psf)", f"{lc3.q_trans:.1f}")
-            lp3.metric("q long (psf)",  f"{lc3.q_long:.1f}")
-            lp4.metric("Ice t (in)",    f"{lc3.ice_t:.3f}")
-            lp5.metric("Ice density",   f"{lc3.ice_density:.0f} pcf")
+            lp = st.columns(5)
+            lp[0].metric("DLF", f"{lc3.dlf:.2f}")
+            lp[1].metric("q trans (psf)", f"{lc3.q_trans:.1f}")
+            lp[2].metric("q long (psf)", f"{lc3.q_long:.1f}")
+            lp[3].metric("Ice t (in)", f"{lc3.ice_t:.3f}")
+            lp[4].metric("Ice density", f"{lc3.ice_density:.0f} pcf")
 
             st.subheader("Base reactions — first-order (no P-delta)")
-            fo3 = first_order_forces(m3, spec3.total_length - 1e-9)
-            br1, br2, br3, br4, br5, br6 = st.columns(6)
-            br1.metric("P (kips)",  f"{fo3['P']:+.3f}")
-            br2.metric("Vx (kips)", f"{fo3['Vx']:+.3f}")
-            br3.metric("Vy (kips)", f"{fo3['Vy']:+.3f}")
-            br4.metric("Mx (ft-k)", f"{fo3['Mx']:+.1f}")
-            br5.metric("My (ft-k)", f"{fo3['My']:+.1f}")
-            br6.metric("T (ft-k)",  f"{fo3['T']:+.3f}")
+            fo3 = first_order_forces(m3, spec3.groundline_rel - 1e-9)
+            br_ = st.columns(6)
+            for col, (k, u) in zip(br_, [('P', 'kips'), ('Vx', 'kips'), ('Vy', 'kips'),
+                                         ('Mx', 'ft-k'), ('My', 'ft-k'), ('T', 'ft-k')]):
+                col.metric(f"{k} ({u})", f"{fo3[k]:+.2f}")
+            st.caption("Second-order (P-delta) forces are in Tab 5 · Deflection.")
 
             st.subheader("Point loads at attachment points")
             if m3.points:
                 st.dataframe(pd.DataFrame([{
-                    "label":       pl.label,
-                    "s (ft)":      round(pl.s, 3),
+                    "label": pl.label, "s (ft)": round(pl.s, 3),
                     "ht AGL (ft)": round(m3.z_of(pl.s), 3),
-                    "dx (ft)":     round(pl.dx, 3),
-                    "dy (ft)":     round(pl.dy, 3),
-                    "dz (ft)":     round(pl.dz, 3),
-                    "Fx (kips)":   round(pl.Fx, 4),
-                    "Fy (kips)":   round(pl.Fy, 4),
-                    "Fz (kips)":   round(pl.Fz, 4),
+                    "dx (ft)": round(pl.dx, 3), "dy (ft)": round(pl.dy, 3), "dz (ft)": round(pl.dz, 3),
+                    "Fx (kips)": round(pl.Fx, 4), "Fy (kips)": round(pl.Fy, 4), "Fz (kips)": round(pl.Fz, 4),
                 } for pl in sorted(m3.points, key=lambda x: x.s)]),
-                    use_container_width=True, hide_index=True)
-                tc1, tc2, tc3 = st.columns(3)
-                tc1.metric("∑ Fx (kips)", f"{sum(pl.Fx for pl in m3.points):+.3f}")
-                tc2.metric("∑ Fy (kips)", f"{sum(pl.Fy for pl in m3.points):+.3f}")
-                tc3.metric("∑ Fz (kips)", f"{sum(pl.Fz for pl in m3.points):+.3f}")
+                    width="stretch", hide_index=True)
+                tc = st.columns(3)
+                tc[0].metric("∑ Fx (kips)", f"{sum(pl.Fx for pl in m3.points):+.3f}")
+                tc[1].metric("∑ Fy (kips)", f"{sum(pl.Fy for pl in m3.points):+.3f}")
+                tc[2].metric("∑ Fz (kips)", f"{sum(pl.Fz for pl in m3.points):+.3f}")
             else:
                 st.info("No attachment point loads for this load case.")
 
             st.subheader("Shaft element loads")
             st.dataframe(pd.DataFrame([{
-                "s_top (ft)":    round(e.s_top, 3),
-                "s_bot (ft)":    round(e.s_bot, 3),
-                "ht AGL (ft)":   round(m3.z_of(e.s_mid), 3),
-                "above GL":      e.above_ground,
-                "D_wind (in)":   round(e.D_wind, 3),
-                "D_out (in)":    round(e.D_out, 3),
-                "Fy wind (k)":   round(e.fy, 5),
-                "Fx wind (k)":   round(e.fx, 5),
+                "s_top (ft)": round(e.s_top, 3), "s_bot (ft)": round(e.s_bot, 3),
+                "ht AGL (ft)": round(m3.z_of(e.s_mid), 3), "above GL": e.above_ground,
+                "D_wind (in)": round(e.D_wind, 3), "D_out (in)": round(e.D_out, 3),
+                "Fy wind (k)": round(e.fy, 5), "Fx wind (k)": round(e.fx, 5),
                 "Fz DL+ice (k)": round(e.fz, 5),
-            } for e in m3.elements]), use_container_width=True, hide_index=True)
-            sc1, sc2, sc3 = st.columns(3)
-            sc1.metric("∑ Fy shaft wind (kips)",   f"{sum(e.fy for e in m3.elements):+.3f}")
-            sc2.metric("∑ Fx shaft wind (kips)",   f"{sum(e.fx for e in m3.elements):+.3f}")
-            sc3.metric("∑ Fz shaft DL+ice (kips)", f"{sum(e.fz for e in m3.elements):+.3f}")
+            } for e in m3.elements]), width="stretch", hide_index=True)
+            sc = st.columns(3)
+            sc[0].metric("∑ Fy shaft wind (kips)", f"{sum(e.fy for e in m3.elements):+.3f}")
+            sc[1].metric("∑ Fx shaft wind (kips)", f"{sum(e.fx for e in m3.elements):+.3f}")
+            sc[2].metric("∑ Fz shaft DL+ice (kips)", f"{sum(e.fz for e in m3.elements):+.3f}")
 
             st.subheader("Load distribution along shaft")
             above3 = [e for e in m3.elements if e.above_ground]
-            hts3   = [m3.z_of(e.s_mid) for e in above3]
-            fig3, (ax3a, ax3b) = plt.subplots(1, 2, figsize=(10, 5))
-            ax3a.barh(hts3, [e.fy * 1000 for e in above3], height=0.2, color='steelblue')
-            ax3a.axhline(0, color='brown', linestyle='--', linewidth=1, label='Ground line')
-            ax3a.set_xlabel("Transverse wind load per element (lb)")
-            ax3a.set_ylabel("Height AGL (ft)"); ax3a.set_title("Shaft transverse wind")
-            ax3a.legend(); ax3a.grid(True, alpha=0.3)
-            ax3b.barh(hts3, [e.fz * 1000 for e in above3], height=0.2, color='darkorange')
-            ax3b.axhline(0, color='brown', linestyle='--', linewidth=1, label='Ground line')
-            ax3b.set_xlabel("Vertical load per element (lb)")
-            ax3b.set_ylabel("Height AGL (ft)"); ax3b.set_title("Shaft self-weight + ice")
-            ax3b.legend(); ax3b.grid(True, alpha=0.3)
+            hts3 = [m3.z_of(e.s_mid) for e in above3]
+            fig3, (a3, b3) = plt.subplots(1, 2, figsize=(10, 5))
+            a3.barh(hts3, [e.fy * 1000 for e in above3], height=0.2, color='steelblue')
+            a3.set_xlabel("Transverse wind per element (lb)"); a3.set_ylabel("Height AGL (ft)")
+            a3.set_title("Shaft transverse wind"); a3.grid(True, alpha=0.3)
+            b3.barh(hts3, [e.fz * 1000 for e in above3], height=0.2, color='darkorange')
+            b3.set_xlabel("Vertical load per element (lb)"); b3.set_ylabel("Height AGL (ft)")
+            b3.set_title("Shaft self-weight + ice"); b3.grid(True, alpha=0.3)
             plt.tight_layout(); st.pyplot(fig3); plt.close(fig3)
-
-            st.subheader("First-order moment diagram (transverse)")
-            s_vals  = np.linspace(0, spec3.groundline_rel, 60)
-            mx_vals = [first_order_forces(m3, s)['Mx'] for s in s_vals]
-            ht_vals = [m3.z_of(s) for s in s_vals]
-            fig4, ax4 = plt.subplots(figsize=(7, 5))
-            ax4.plot(mx_vals, ht_vals, color='steelblue', linewidth=2)
-            ax4.axhline(0, color='brown', linestyle='--', linewidth=1, label='Ground line')
-            ax4.axvline(0, color='gray', linewidth=0.5)
-            ax4.fill_betweenx(ht_vals, mx_vals, 0, alpha=0.15, color='steelblue')
-            ax4.set_xlabel("First-order Mx (ft-kips)"); ax4.set_ylabel("Height AGL (ft)")
-            ax4.set_title(f"Transverse moment diagram — {sel_case3}")
-            ax4.legend(); ax4.grid(True, alpha=0.3)
-            st.pyplot(fig4); plt.close(fig4)
-
         except Exception as e:
-            st.error(f"Error: {e}")
-            import traceback; st.code(traceback.format_exc())
+            show_error(e)
 
 # ── TAB 4: ASCE 48-19 STRENGTH CHECK ──────────────────────────────────────
 with tab4:
@@ -379,264 +339,282 @@ with tab4:
         st.info("Upload a PLS-POLE XML file in the sidebar to begin.")
     else:
         try:
-            from pls_pole_xml_parser import (
-                parse_pls_pole_xml as _p4, get_single_table as _gst4,
-                get_field as _gf4, get_load_case_instances as _glci4
-            )
-            from geometry import (build_sections as _bs4, w_over_t as _wot4,
-                                  thickness_from_wt as _tfw4)
-            from loads import Baseline as _BL4, build_load_model as _blm4, first_order_forces as _fof4
-            from mechanics_engine import combined_stress_check
+            from pls_pole_xml_parser import (get_single_table as _gst4, get_field as _gf4,
+                                             get_load_case_instances as _glci4)
+            from geometry import w_over_t as _wot4
+            from mechanics_engine import perimeter_stress_check
 
-            p4    = _p4(tmp_path)
-            spec4 = build_spec(p4, _gf4, _gst4)
+            p4 = load_parsed(tmp_path)
+            spec4 = build_spec(p4)
+            cand4 = run_candidate(tmp_path, BR, SHEAR, LAP)
             summ4 = _gst4(p4, 'summary_of_steel_pole_usages')[0]
-            base4 = _BL4.from_xml(tmp_path)
-            lay4  = spec4.layout()
+            gov_case4 = summ4.get('load_case')
+            cases4 = list(cand4.cases.keys())
+            pls_by_case = {r['load_case']: _gf4(r, 'maximum_usage')
+                           for r in _gst4(p4, 'summary_of_steel_pole_usages_by_load_case')}
 
-            all_cases4  = list(base4.load_cases.keys())
-            gov_case4   = summ4.get('load_case', all_cases4[0])
-            def4_idx    = all_cases4.index(gov_case4) if gov_case4 in all_cases4 else 0
+            # ---- all-cases summary
+            st.subheader("All load cases — max strength usage")
+            k = st.columns(3)
+            k[0].metric("Engine max usage", f"{cand4.max_strength:.2f}%")
+            k[1].metric("PLS-POLE max usage", f"{_gf4(summ4, 'maximum_usage'):.2f}%")
+            k[2].metric("Governing case (engine)", cand4.gov_strength_case)
+            st.dataframe(pd.DataFrame([{
+                "load case": c,
+                "engine max %": round(cr.max_strength, 2),
+                "PLS max %": pls_by_case.get(c),
+                "diff (pts)": round(cr.max_strength - pls_by_case[c], 2) if c in pls_by_case else None,
+                "at ht AGL (ft)": round(cr.gov_row.get('height_agl', float('nan')), 2),
+            } for c, cr in cand4.cases.items()]), width="stretch", hide_index=True)
 
+            st.divider()
             col_a, col_b = st.columns([2, 1])
             with col_a:
-                sel_case4 = st.selectbox("Load case", all_cases4, index=def4_idx,
-                                         key="lc4",
-                                         help="Defaults to governing case from PLS-POLE summary")
+                sel_case4 = st.selectbox("Load case (detail)", cases4,
+                                         index=gov_index(cases4, gov_case4), key="lc4")
                 st.caption(f"Governing case per PLS-POLE: **{gov_case4}**")
             with col_b:
-                section_mode = st.radio("Section points",
-                                        ["PLS-POLE points", "Custom spacing"],
+                section_mode = st.radio("Section points", ["PLS-POLE points", "Engine points (1 ft)"],
                                         key="secmode4")
-                if section_mode == "Custom spacing":
-                    chk_spacing = st.slider("Spacing (ft)", 1.0, 10.0, 5.0, 0.5, key="sp4")
+                force_src = st.radio("Forces", ["Engine (P-delta)", "PLS-POLE reported"],
+                                     key="force4", disabled=(section_mode != "PLS-POLE points"))
 
-            shear_mode4 = st.radio(
-                "Shear mode", ["transverse_only", "resultant"],
-                index=0, horizontal=True,
-                help="'transverse_only' matches PLS-POLE calibration. "
-                     "'resultant' is the textbook interpretation.",
-                key="shear4"
-            )
+            cr4 = cand4.cases[sel_case4]
+            lay4 = spec4.layout()
 
-            m4  = _blm4(spec4, base4, sel_case4, ds=0.25)
-            usages4   = _glci4(p4, 'detailed_steel_pole_usages')
-            pls_rows4 = sorted(usages4.get(sel_case4, []),
-                               key=lambda r: _gf4(r, 'rel_dist'))
+            def tube_for(rd):
+                for i, tb in enumerate(lay4):
+                    lo = max(tb['start'], lay4[i - 1]['end'] if i > 0 else tb['start'])
+                    hi = min(tb['end'], lay4[i + 1]['start'] if i + 1 < len(lay4) else tb['end'])
+                    if lo - 1e-6 <= rd <= hi + 1e-6:
+                        return tb
+                return lay4[-1]
 
-            # ---- Build check points ----
+            rows4 = []
             if section_mode == "PLS-POLE points":
-                check_pts = []
-                for r in pls_rows4:
-                    rd  = _gf4(r, 'rel_dist')
-                    # D: prefer XML field, fall back to spec geometry
-                    D   = _gf4(r, 'outer_diameter') or spec4.diameter_at(rd)
-                    wt  = _gf4(r, 'w_t_max') or 0.0
-                    # t: recover from w/t if available, else use spec
-                    t   = (_tfw4(D, wt) if wt > 0 else spec4.thickness_at(rd))
-                    # recompute w/t from spec if XML gave zero
-                    if wt == 0 and t and t > 0:
-                        wt = _wot4(D, t)
-                    fy  = next((tb['fy'] for tb in lay4
-                                if tb['start'] - 1e-6 <= rd <= tb['end'] + 1e-6), 65.0)
-                    check_pts.append({
-                        'rd': rd, 'D': D, 't': t, 'wt': wt, 'fy': fy,
-                        'pls_usage': _gf4(r, 'max_usage'),
-                        'pls_pa':    _gf4(r, 'p_a'),
-                        'pls_ms':    _gf4(r, 'm_s'),
-                        'pls_vq':    _gf4(r, 'v_q'),
-                        'pls_tr':    _gf4(r, 't_r'),
-                        'pls_res':   _gf4(r, 'res'),
-                        'pls_Fa':    _gf4(r, 'fa_min'),
-                        'joint_pos': r.get('joint_position', ''),
-                        'P':  _gf4(r, 'axial_force') or 0.0,
-                        'Mx': _gf4(r, 'trans_mom_local_mx') or 0.0,
-                        'My': _gf4(r, 'long_mom_local_my') or 0.0,
-                        'Vt': _gf4(r, 'tran_shear') or 0.0,
-                        'Vl': _gf4(r, 'long_shear') or 0.0,
-                        'T':  _gf4(r, 'tors_mom') or 0.0,
-                    })
-            else:
-                secs4c = _bs4(spec4, spacing=chk_spacing)
-                check_pts = []
-                for s in secs4c:
-                    if s['below_groundline']:
+                pls_rows = sorted(_glci4(p4, 'detailed_steel_pole_usages').get(sel_case4, []),
+                                  key=lambda r: _gf4(r, 'rel_dist'))
+                for r in pls_rows:
+                    rd = _gf4(r, 'rel_dist')
+                    if rd > spec4.groundline_rel + 1e-6:
                         continue
-                    rd    = s['rel_dist']
-                    fo4c  = _fof4(m4, rd)
-                    check_pts.append({
-                        'rd': rd, 'D': s['D'], 't': s['t'],
-                        'wt': s['w_over_t'], 'fy': s['fy'],
-                        'pls_usage': None,
-                        'pls_pa': None, 'pls_ms': None,
-                        'pls_vq': None, 'pls_tr': None,
-                        'pls_res': None, 'pls_Fa': None,
-                        'joint_pos': '',
-                        'P':  fo4c['P'],  'Mx': fo4c['Mx'], 'My': fo4c['My'],
-                        'Vt': fo4c['Vy'], 'Vl': fo4c['Vx'], 'T':  fo4c['T'],
+                    tb = tube_for(rd)
+                    D = tb['d_top'] + spec4.taper * (rd - tb['start'])
+                    t = tb['thickness']
+                    wt = _wot4(D, t, BR)
+                    if force_src.startswith("Engine"):
+                        f = cr4.defl.section_forces(rd, r.get('joint_position') != 'End')
+                        F = (f['axial_local'], f['Mx'], f['My'], f['Vy_local'], f['Vx_local'], f['T'])
+                    else:
+                        F = tuple(_gf4(r, k) or 0.0 for k in ('axial_force', 'trans_mom_local_mx',
+                                  'long_mom_local_my', 'tran_shear', 'long_shear', 'tors_mom'))
+                    c = perimeter_stress_check(*F, D, t, tb['fy'], wt, SHEAR)
+                    pu = _gf4(r, 'max_usage')
+                    rows4.append({
+                        'rel_dist (ft)': round(rd, 3), 'ht AGL (ft)': round(spec4.groundline_rel - rd, 3),
+                        'side': r.get('joint_position'), 'tube': tb['tube_no'],
+                        'D (in)': round(D, 3), 't (in)': t, 'w/t': round(wt, 2),
+                        'P (k)': round(F[0], 3), 'Mx (ft-k)': round(F[1], 1), 'My (ft-k)': round(F[2], 1),
+                        'PLS Mx': _gf4(r, 'trans_mom_local_mx'),
+                        'Fa (ksi)': round(c['Fa'], 2) if c['Fa'] else None, 'Fa eq': c['Fa_equation'],
+                        'p_a': round(c['p_a'], 3), 'PLS p_a': _gf4(r, 'p_a'),
+                        'm_s': round(c['m_s'], 3), 'PLS m_s': _gf4(r, 'm_s'),
+                        'v_q': round(c['v_q'], 3), 'PLS v_q': _gf4(r, 'v_q'),
+                        'res': round(c['res'], 3), 'PLS res': _gf4(r, 'res'),
+                        'calc usage %': round(c['usage'], 2) if c['usage'] else None,
+                        'PLS usage %': pu,
+                        'diff (pts)': round(c['usage'] - pu, 2) if (c['usage'] is not None and pu is not None) else None,
+                    })
+            else:
+                for x in cr4.rows:
+                    rows4.append({
+                        'rel_dist (ft)': round(x['s'], 3), 'ht AGL (ft)': round(x['height_agl'], 3),
+                        'side': x['side'], 'tube': x['tube_no'], 'D (in)': round(x['D'], 3),
+                        't (in)': x['t'], 'w/t': round(x['w_over_t'], 2), 'P (k)': round(x['P'], 3),
+                        'Mx (ft-k)': round(x['Mx'], 1), 'My (ft-k)': round(x['My'], 1),
+                        'Fa (ksi)': round(x['Fa'], 2) if x['Fa'] else None, 'Fa eq': x['Fa_equation'],
+                        'p_a': round(x['p_a'], 3), 'm_s': round(x['m_s'], 3),
+                        'v_q': round(x['v_q'], 3), 'res': round(x['res'], 3),
+                        'calc usage %': round(x['usage'], 2) if x['usage'] else None,
                     })
 
-            # ---- Run strength check ----
-            results4 = []
-            for cp in check_pts:
-                if not cp['D'] or not cp['t'] or cp['t'] <= 0 or not cp['wt']:
-                    continue
-                chk = combined_stress_check(
-                    P=cp['P'], Mx=cp['Mx'], My=cp['My'],
-                    V_tran=cp['Vt'], V_long=cp['Vl'], Torsion_ftk=cp['T'],
-                    D=cp['D'], t=cp['t'], Fy=cp['fy'], w_over_t=cp['wt'],
-                    shear_mode=shear_mode4
-                )
-                ht = m4.z_of(cp['rd'])
-                results4.append({
-                    'rel_dist (ft)': round(cp['rd'], 3),
-                    'ht AGL (ft)':   round(ht, 3),
-                    'joint_pos':     cp['joint_pos'],
-                    'D (in)':        round(cp['D'], 3),
-                    't (in)':        round(cp['t'], 4),
-                    'w/t':           round(cp['wt'], 2),
-                    'Fy (ksi)':      cp['fy'],
-                    'Fa (ksi)':      round(chk['Fa'], 3) if chk['Fa'] else None,
-                    'Fa eq':         chk['Fa_equation'],
-                    'p_a (ksi)':     round(chk['p_a'], 4),
-                    'm_s (ksi)':     round(chk['m_s'], 4),
-                    'v_q (ksi)':     round(chk['v_q'], 4),
-                    't_r (ksi)':     round(chk['t_r'], 4),
-                    'res (ksi)':     round(chk['res'], 4),
-                    'calc usage %':  round(chk['usage'], 2) if chk['usage'] else None,
-                    'PLS usage %':   round(cp['pls_usage'], 2) if cp['pls_usage'] else None,
-                    'diff (pts)':    round(chk['usage'] - cp['pls_usage'], 2)
-                                     if (chk['usage'] and cp['pls_usage']) else None,
-                    'PLS p_a':  cp['pls_pa'],  'PLS m_s': cp['pls_ms'],
-                    'PLS v_q':  cp['pls_vq'],  'PLS t_r': cp['pls_tr'],
-                    'PLS res':  cp['pls_res'],  'PLS Fa':  cp['pls_Fa'],
-                })
-
-            df4 = pd.DataFrame(results4)
-
+            df4 = pd.DataFrame(rows4)
             if df4.empty:
-                st.warning("No valid check points produced. Check the debug expander below.")
-                with st.expander("🔍 Debug: raw check points"):
-                    st.dataframe(pd.DataFrame(check_pts),
-                                 use_container_width=True, hide_index=True)
+                st.warning("No check points for this case.")
             else:
-                # ---- Governing section ----
                 valid4 = df4[df4['calc usage %'].notna()]
-                if not valid4.empty:
-                    gov4 = valid4.loc[valid4['calc usage %'].idxmax()]
-                    st.subheader("Governing section")
-                    g1, g2, g3, g4c, g5 = st.columns(5)
-                    g1.metric("Max usage",   f"{gov4['calc usage %']:.2f}%")
-                    g2.metric("At ht AGL",   f"{gov4['ht AGL (ft)']:.2f} ft")
-                    g3.metric("D / t",       f"{gov4['D (in)']:.2f} / {gov4['t (in)']:.4f}")
-                    g4c.metric("Fa (ksi)",   f"{gov4['Fa (ksi)']:.3f}")
-                    g5.metric("Fa equation", str(gov4['Fa eq']))
-                    if gov4['PLS usage %']:
-                        d1, d2 = st.columns(2)
-                        d1.metric("PLS-POLE usage at same point",
-                                  f"{gov4['PLS usage %']:.2f}%")
-                        d2.metric("Difference", f"{gov4['diff (pts)']:+.2f} pts")
+                gov4 = valid4.loc[valid4['calc usage %'].idxmax()]
+                st.subheader(f"Governing section — {sel_case4}")
+                g_ = st.columns(5)
+                g_[0].metric("Max usage", f"{gov4['calc usage %']:.2f}%")
+                g_[1].metric("At ht AGL", f"{gov4['ht AGL (ft)']:.2f} ft")
+                g_[2].metric("D / t", f"{gov4['D (in)']:.2f} / {gov4['t (in)']:.4f}")
+                g_[3].metric("Fa (ksi)", f"{gov4['Fa (ksi)']:.2f}")
+                g_[4].metric("Fa equation", str(gov4['Fa eq']))
 
-                # ---- Full results table ----
-                st.subheader("Full section check results")
-                display_cols = ['rel_dist (ft)', 'ht AGL (ft)', 'D (in)', 't (in)',
-                                'w/t', 'Fa (ksi)', 'p_a (ksi)', 'm_s (ksi)',
-                                'v_q (ksi)', 't_r (ksi)', 'res (ksi)',
-                                'calc usage %', 'PLS usage %', 'diff (pts)']
-                st.dataframe(df4[[c for c in display_cols if c in df4.columns]],
-                             use_container_width=True, hide_index=True)
+                st.subheader("Section check results")
+                st.dataframe(df4, width="stretch", hide_index=True)
 
-                # ---- Usage profile plot ----
-                st.subheader("Usage % vs height")
-                fig4a, ax4a = plt.subplots(figsize=(7, 6))
-                ax4a.plot(valid4['calc usage %'], valid4['ht AGL (ft)'],
-                          color='steelblue', linewidth=2, label='Calc (this engine)')
-                if valid4['PLS usage %'].notna().any():
-                    ax4a.plot(valid4['PLS usage %'], valid4['ht AGL (ft)'],
-                              color='darkorange', linewidth=1.5, linestyle='--',
-                              label='PLS-POLE reported')
-                ax4a.axvline(100, color='red', linestyle='--', linewidth=1, label='100% limit')
-                ax4a.axhline(0, color='brown', linestyle='--', linewidth=1, label='Ground line')
-                ax4a.set_xlabel("Usage (%)")
-                ax4a.set_ylabel("Height above ground line (ft)")
-                ax4a.set_title(f"Usage profile — {sel_case4}")
-                ax4a.legend(); ax4a.grid(True, alpha=0.3)
-                st.pyplot(fig4a); plt.close(fig4a)
+                cA, cB = st.columns(2)
+                with cA:
+                    fig4a, ax4a = plt.subplots(figsize=(6, 6))
+                    ax4a.plot(valid4['calc usage %'], valid4['ht AGL (ft)'], color='steelblue',
+                              linewidth=2, label='Engine')
+                    if 'PLS usage %' in valid4 and valid4['PLS usage %'].notna().any():
+                        ax4a.plot(valid4['PLS usage %'], valid4['ht AGL (ft)'], color='darkorange',
+                                  linewidth=1.5, linestyle='--', label='PLS-POLE')
+                    ax4a.axvline(100, color='red', linestyle='--', linewidth=1, label='100%')
+                    ax4a.set_xlabel("Usage (%)"); ax4a.set_ylabel("Height AGL (ft)")
+                    ax4a.set_title("Usage vs height"); ax4a.legend(); ax4a.grid(True, alpha=0.3)
+                    st.pyplot(fig4a); plt.close(fig4a)
+                with cB:
+                    fig4b, ax4b = plt.subplots(figsize=(6, 6))
+                    for col in ('p_a', 'm_s', 'v_q'):
+                        ax4b.plot(valid4[col].abs(), valid4['ht AGL (ft)'], label=f'|{col}|', linewidth=1.5)
+                    ax4b.plot(valid4['res'], valid4['ht AGL (ft)'], label='res', linewidth=2,
+                              color='black', linestyle='--')
+                    ax4b.set_xlabel("Stress at governing point (ksi)"); ax4b.set_ylabel("Height AGL (ft)")
+                    ax4b.set_title("Stress components"); ax4b.legend(fontsize=8); ax4b.grid(True, alpha=0.3)
+                    st.pyplot(fig4b); plt.close(fig4b)
 
-                # ---- Stress components plot ----
-                st.subheader("Stress components vs height")
-                fig4b, ax4b = plt.subplots(figsize=(7, 6))
-                ax4b.plot(valid4['p_a (ksi)'], valid4['ht AGL (ft)'],
-                          label='p_a', linewidth=1.5)
-                ax4b.plot(valid4['m_s (ksi)'], valid4['ht AGL (ft)'],
-                          label='m_s', linewidth=1.5)
-                ax4b.plot(valid4['v_q (ksi)'], valid4['ht AGL (ft)'],
-                          label='v_q', linewidth=1.5)
-                ax4b.plot(valid4['t_r (ksi)'], valid4['ht AGL (ft)'],
-                          label='t_r', linewidth=1.5)
-                ax4b.plot(valid4['res (ksi)'], valid4['ht AGL (ft)'],
-                          label='resultant', linewidth=2,
-                          color='black', linestyle='--')
-                ax4b.axhline(0, color='brown', linestyle='--',
-                             linewidth=1, label='Ground line')
-                ax4b.set_xlabel("Stress (ksi)")
-                ax4b.set_ylabel("Height above ground line (ft)")
-                ax4b.set_title(f"Stress components — {sel_case4}")
-                ax4b.legend(fontsize=8); ax4b.grid(True, alpha=0.3)
-                st.pyplot(fig4b); plt.close(fig4b)
-
-                # ---- Engine vs PLS difference plot ----
-                if section_mode == "PLS-POLE points":
-                    diff_valid = df4[df4['diff (pts)'].notna()]
-                    if not diff_valid.empty:
-                        st.subheader("Engine vs PLS-POLE usage difference")
-                        fig4c, ax4c = plt.subplots(figsize=(7, 5))
-                        colors = ['red' if abs(d) > 2 else 'steelblue'
-                                  for d in diff_valid['diff (pts)']]
-                        ax4c.barh(diff_valid['ht AGL (ft)'],
-                                  diff_valid['diff (pts)'],
-                                  height=0.4, color=colors)
-                        ax4c.axvline(0,  color='black', linewidth=0.8)
-                        ax4c.axvline(2,  color='red', linestyle='--',
-                                     linewidth=0.8, label='±2 pt band')
-                        ax4c.axvline(-2, color='red', linestyle='--', linewidth=0.8)
-                        ax4c.axhline(0,  color='brown', linestyle='--',
-                                     linewidth=1, label='Ground line')
-                        ax4c.set_xlabel("Calc usage % − PLS usage % (pts)")
-                        ax4c.set_ylabel("Height above ground line (ft)")
-                        ax4c.set_title(f"Engine vs PLS-POLE — {sel_case4}")
-                        ax4c.legend(fontsize=8); ax4c.grid(True, alpha=0.3)
-                        st.pyplot(fig4c); plt.close(fig4c)
-
-                        diffs = diff_valid['diff (pts)']
-                        st1, st2, st3, st4s = st.columns(4)
-                        st1.metric("Mean diff",    f"{diffs.mean():+.3f} pts")
-                        st2.metric("Max |diff|",   f"{diffs.abs().max():.3f} pts")
-                        st3.metric("Std dev",      f"{diffs.std():.3f} pts")
-                        st4s.metric("Points > ±2", f"{(diffs.abs() > 2).sum()}")
-
-                # ---- Detailed component comparison ----
-                with st.expander("Detailed component comparison (calc vs PLS-POLE)"):
-                    comp_cols = ['rel_dist (ft)', 'ht AGL (ft)',
-                                 'p_a (ksi)', 'PLS p_a',
-                                 'm_s (ksi)', 'PLS m_s',
-                                 'v_q (ksi)', 'PLS v_q',
-                                 't_r (ksi)', 'PLS t_r',
-                                 'res (ksi)', 'PLS res',
-                                 'Fa (ksi)',  'PLS Fa',
-                                 'calc usage %', 'PLS usage %', 'diff (pts)']
-                    st.dataframe(df4[[c for c in comp_cols if c in df4.columns]],
-                                 use_container_width=True, hide_index=True)
-
+                if 'diff (pts)' in df4 and df4['diff (pts)'].notna().any():
+                    d = df4[df4['diff (pts)'].notna()]
+                    st.subheader("Engine vs PLS-POLE usage difference")
+                    s_ = st.columns(4)
+                    s_[0].metric("Mean diff", f"{d['diff (pts)'].mean():+.3f} pts")
+                    s_[1].metric("Max |diff|", f"{d['diff (pts)'].abs().max():.3f} pts")
+                    s_[2].metric("Std dev", f"{d['diff (pts)'].std():.3f} pts")
+                    s_[3].metric("Points > ±2", f"{int((d['diff (pts)'].abs() > 2).sum())}")
+                    fig4c, ax4c = plt.subplots(figsize=(7, 4))
+                    ax4c.barh(d['ht AGL (ft)'], d['diff (pts)'], height=0.6,
+                              color=['red' if abs(v) > 2 else 'steelblue' for v in d['diff (pts)']])
+                    ax4c.axvline(0, color='black', linewidth=0.8)
+                    ax4c.set_xlabel("Engine − PLS (usage pts)"); ax4c.set_ylabel("Height AGL (ft)")
+                    ax4c.grid(True, alpha=0.3)
+                    st.pyplot(fig4c); plt.close(fig4c)
         except Exception as e:
-            st.error(f"Error: {e}")
-            import traceback; st.code(traceback.format_exc())
+            show_error(e)
 
-# ── TAB 5: OPTIMIZER ───────────────────────────────────────────────────────
+# ── TAB 5: DEFLECTION ─────────────────────────────────────────────────────
 with tab5:
-    st.header("Minimum-Weight Optimizer")
-    st.info("🚧 Coming soon")
+    st.header("Deflection — second-order (P-delta) solver")
+    if not tmp_path:
+        st.info("Upload a PLS-POLE XML file in the sidebar to begin.")
+    else:
+        try:
+            from pls_pole_xml_parser import (get_single_table as _gst5, get_field as _gf5,
+                                             get_load_case_instances as _glci5)
+            from loads import build_load_model as _blm5
+            from deflection import solve_deflection
 
-# ── CLEANUP ────────────────────────────────────────────────────────────────
-if tmp_path and os.path.exists(tmp_path):
-    os.unlink(tmp_path)
+            p5 = load_parsed(tmp_path)
+            spec5 = build_spec(p5)
+            base5 = load_baseline(tmp_path)
+            cand5 = run_candidate(tmp_path, BR, SHEAR, LAP)
+
+            tips = {r['load_case']: r for r in _gst5(p5, 'summary_of_tip_deflections_for_all_load_cases')}
+            pdu = ({r['load_case']: r for r in _gst5(p5, 'pole_deflection_usages_for_all_load_cases')}
+                   if 'pole_deflection_usages_for_all_load_cases' in p5['tables'] else {})
+
+            st.subheader("Deflection limit check")
+            k = st.columns(3)
+            if cand5.max_defl_usage is not None:
+                pls_max = max((_gf5(r, 'usage') for r in pdu.values()), default=None)
+                k[0].metric("Engine max deflection usage", f"{cand5.max_defl_usage:.2f}%")
+                k[1].metric("PLS-POLE max deflection usage", f"{pls_max:.2f}%" if pls_max is not None else "—")
+                k[2].metric("Governing case", cand5.gov_defl_case)
+            else:
+                st.info("No load case in this XML has a deflection limit.")
+            st.caption(f"Deflection limit basis: above-ground height = {spec5.agl_height:.2f} ft. "
+                       f"Lap stiffness: {LAP}.")
+
+            st.subheader("All load cases — tip deflection")
+            rows5 = []
+            for c, cr in cand5.cases.items():
+                r = cr.defl
+                T = tips.get(c)
+                pt = _gf5(T, 'tran_defl') if T else None
+                dc = cr.defl_check
+                rows5.append({
+                    "load case": c,
+                    "trans (in)": round(r.tip_trans_in, 2), "PLS trans": pt,
+                    "diff %": round((r.tip_trans_in / pt - 1) * 100, 2) if (pt and abs(pt) > 1) else None,
+                    "long (in)": round(r.tip_long_in, 2), "PLS long": _gf5(T, 'long_defl') if T else None,
+                    "vert (in)": round(r.tip_vert_in, 2), "PLS vert": _gf5(T, 'vert_defl') if T else None,
+                    "limit": f"{dc['limit']} {dc['check']}" if dc else "No Limit",
+                    "usage %": round(dc['usage'], 2) if dc and dc.get('usage') is not None else None,
+                    "PLS usage %": _gf5(pdu[c], 'usage') if c in pdu else None,
+                    "iter": r.iterations, "converged": r.converged,
+                })
+            st.dataframe(pd.DataFrame(rows5), width="stretch", hide_index=True)
+
+            st.divider()
+            cases5 = list(cand5.cases.keys())
+            default5 = cand5.gov_defl_case or _gst5(p5, 'summary_of_steel_pole_usages')[0].get('load_case')
+            sel5 = st.selectbox("Load case (detail)", cases5, index=gov_index(cases5, default5), key="lc5")
+            r5 = cand5.cases[sel5].defl
+            gl5 = spec5.groundline_rel
+
+            m_ = st.columns(4)
+            m_[0].metric("Tip transverse", f"{r5.tip_trans_in:.2f} in")
+            m_[1].metric("Tip longitudinal", f"{r5.tip_long_in:.2f} in")
+            m_[2].metric("Tip vertical", f"{r5.tip_vert_in:.2f} in")
+            m_[3].metric("Tip from vertical axis", f"{r5.tip_horiz_ft:.3f} ft")
+
+            pls5 = sorted(_glci5(p5, 'detailed_steel_pole_usages').get(sel5, []),
+                          key=lambda q: _gf5(q, 'rel_dist'))
+            fo5 = solve_deflection(_blm5(spec5, base5, sel5, ds=0.25), lap_stiffness=LAP,
+                                   second_order=False)
+
+            cA, cB = st.columns(2)
+            with cA:
+                fig5, ax5 = plt.subplots(figsize=(6, 6))
+                h = gl5 - r5.s
+                ax5.plot(r5.y * 12, h, color='steelblue', linewidth=2, label='Engine transverse')
+                if np.any(np.abs(r5.x) > 1e-4):
+                    ax5.plot(r5.x * 12, h, color='seagreen', linewidth=1.5, label='Engine longitudinal')
+                if pls5:
+                    ax5.scatter([_gf5(q, 'trans_defl') for q in pls5],
+                                [gl5 - _gf5(q, 'rel_dist') for q in pls5],
+                                s=12, color='darkorange', zorder=3, label='PLS-POLE transverse')
+                ax5.axvline(0, color='gray', linewidth=0.5)
+                ax5.set_xlabel("Deflection (in)"); ax5.set_ylabel("Height AGL (ft)")
+                ax5.set_title("Deflected shape"); ax5.legend(fontsize=8); ax5.grid(True, alpha=0.3)
+                st.pyplot(fig5); plt.close(fig5)
+            with cB:
+                fig6, ax6 = plt.subplots(figsize=(6, 6))
+                ax6.plot(r5.Mx, gl5 - r5.s, color='steelblue', linewidth=2, label='Engine 2nd-order Mx')
+                ax6.plot(fo5.Mx, gl5 - fo5.s, color='gray', linewidth=1, linestyle=':', label='1st-order Mx')
+                if pls5:
+                    ax6.scatter([_gf5(q, 'trans_mom_local_mx') for q in pls5],
+                                [gl5 - _gf5(q, 'rel_dist') for q in pls5],
+                                s=12, color='darkorange', zorder=3, label='PLS-POLE Mx')
+                ax6.set_xlabel("Mx (ft-k)"); ax6.set_ylabel("Height AGL (ft)")
+                ax6.set_title("Transverse moment: P-delta effect"); ax6.legend(fontsize=8)
+                ax6.grid(True, alpha=0.3)
+                st.pyplot(fig6); plt.close(fig6)
+
+            mb2, mb1 = r5.Mx[-1], fo5.Mx[-1]
+            st.caption(f"Base Mx: 2nd-order {mb2:.1f} ft-k vs 1st-order {mb1:.1f} ft-k "
+                       f"→ P-delta adds {((mb2 / mb1 - 1) * 100) if abs(mb1) > 1e-6 else 0:+.2f}%.")
+
+            with st.expander("Deflected shape table"):
+                idx = np.arange(0, len(r5.s), 4)
+                st.dataframe(pd.DataFrame({
+                    "rel_dist (ft)": np.round(r5.s[idx], 2), "ht AGL (ft)": np.round(gl5 - r5.s[idx], 2),
+                    "trans (in)": np.round(r5.y[idx] * 12, 3), "long (in)": np.round(r5.x[idx] * 12, 3),
+                    "vert (in)": np.round(r5.dz[idx] * 12, 3),
+                    "Mx 2nd (ft-k)": np.round(r5.Mx[idx], 1), "My 2nd (ft-k)": np.round(r5.My[idx], 1),
+                    "P (k, +comp)": np.round(r5.P[idx], 3),
+                }), width="stretch", hide_index=True)
+
+            if spec5.embedment:
+                st.warning("Embedded pole: solver assumes the pole is FIXED at the ground line "
+                           "(rigid foundation). Not yet validated against an embedded PLS-POLE model.")
+        except Exception as e:
+            show_error(e)
+
+# ── TAB 6: OPTIMIZER ───────────────────────────────────────────────────────
+with tab6:
+    st.header("Minimum-Weight Optimizer")
+    st.info("🚧 Next: greedy search, all load cases, strength + deflection.")

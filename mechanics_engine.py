@@ -104,9 +104,12 @@ def combined_stress_check(P, Mx, My, V_tran, V_long, Torsion_ftk,
     v_q = V_eff * props['Q_over_It_max']
 
     Torsion_ink = Torsion_ftk * 12
-    t_r = Torsion_ink * props['C_over_J_max']
+    t_r = abs(Torsion_ink) * props['C_over_J_max']
 
-    res = math.sqrt((p_a + m_s)**2 + 3 * (v_q + t_r)**2)
+    # Worst fiber: bending puts both tension and compression on the section,
+    # so the axial stress always adds in magnitude. Matches PLS-POLE's
+    # reported 'res' (e.g. p_a=-0.46, m_s=7.90 -> res=8.37).
+    res = math.sqrt((abs(p_a) + m_s)**2 + 3 * (v_q + t_r)**2)
 
     Fa, eq_used = local_buckling_Fa_dodecagonal(w_over_t, Fy)
     usage = (res / Fa * 100) if Fa else None
@@ -115,4 +118,58 @@ def combined_stress_check(P, Mx, My, V_tran, V_long, Torsion_ftk,
         'p_a': p_a, 'm_s': m_s, 'v_q': v_q, 't_r': t_r, 'res': res,
         'Fa': Fa, 'Fa_equation': eq_used, 'usage': usage,
         'Ag': Ag, 'I': I, 'C': C,
+    }
+
+
+# --------------------------------------------------------------------------
+# Perimeter-point stress check (PLS-POLE reproduction)
+# --------------------------------------------------------------------------
+# Stresses are evaluated at 24 points around the 12-sided section: the 12
+# flat mid-points (radius D/2) and the 12 vertices (radius D/(2 cos 15)).
+# Flats are oriented normal to the transverse (y) and longitudinal (x) axes,
+# i.e. flat normals at 0, 30, 60 ... deg measured from +y.
+#   normal stress   sigma(phi) = P/A + (Mx*y + My*x)/I      (signed)
+#   shear stress    tau(phi)   = tau_max*|sin(phi - beta_V)| + tau_torsion
+#   combined        res(phi)   = sqrt(sigma^2 + 3 tau^2)
+# Governing = max over the 24 points. At the bending extreme fiber, shear is
+# zero; at the neutral axis, bending is zero -- which is what PLS-POLE's
+# per-point results show (v_q = 0 at governing rows; res = |p_a| + m_s).
+# Sign convention for P: TENSION positive (PLS-POLE convention).
+
+_PHI_FLAT = [math.radians(30 * k) for k in range(12)]
+_PHI_VERT = [math.radians(15 + 30 * k) for k in range(12)]
+
+
+def perimeter_stress_check(P, Mx, My, V_tran, V_long, Torsion_ftk,
+                           D, t, Fy, w_over_t, shear_mode='resultant'):
+    props = dodecagon_section_properties(D, t)
+    Ag, I = props['Ag'], props['I']
+    p_a = P / Ag
+    Mx_in, My_in = Mx * 12.0, My * 12.0
+    if shear_mode == 'transverse_only':
+        V, beta = abs(V_tran), 0.0
+    else:
+        V, beta = math.hypot(V_tran, V_long), math.atan2(V_long, V_tran)
+    tau_max = V * props['Q_over_It_max']
+    t_r = abs(Torsion_ftk) * 12.0 * props['C_over_J_max']
+    r_flat = D / 2.0
+    r_vert = D / (2.0 * math.cos(math.radians(15)))
+
+    best = None
+    for phi_list, r in ((_PHI_FLAT, r_flat), (_PHI_VERT, r_vert)):
+        for phi in phi_list:
+            y, x = r * math.cos(phi), r * math.sin(phi)
+            sig_b = (Mx_in * y + My_in * x) / I
+            sig = p_a + sig_b
+            tau = tau_max * abs(math.sin(phi - beta)) + t_r
+            res = math.sqrt(sig ** 2 + 3.0 * tau ** 2)
+            if best is None or res > best[0]:
+                best = (res, sig_b, tau - t_r, phi)
+    res, sig_b, v_q, phi = best
+    Fa, eq_used = local_buckling_Fa_dodecagonal(w_over_t, Fy)
+    usage = (res / Fa * 100) if Fa else None
+    return {
+        'p_a': p_a, 'm_s': abs(sig_b), 'v_q': v_q, 't_r': t_r, 'res': res,
+        'Fa': Fa, 'Fa_equation': eq_used, 'usage': usage,
+        'Ag': Ag, 'I': I, 'C': r_flat, 'gov_point_deg': math.degrees(phi),
     }
