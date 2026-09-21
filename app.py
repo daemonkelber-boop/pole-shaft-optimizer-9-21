@@ -287,9 +287,206 @@ with tab2:
     else:
         st.info("Upload a PLS-POLE XML file to begin.")
 
+# ── TAB 3: LOAD MODEL ─────────────────────────────────────────────────────
 with tab3:
     st.header("Load Model")
-    st.info("🚧 Coming soon — loads.py UI")
+    uploaded3 = st.file_uploader("Upload a PLS-POLE XML export", type=["xml"], key="xml3")
+
+    if uploaded3:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
+            tmp.write(uploaded3.read())
+            tmp_path3 = tmp.name
+
+        try:
+            from pls_pole_xml_parser import (
+                parse_pls_pole_xml as _parse3, get_single_table as _gst3,
+                get_field as _gf3, get_load_case_instances as _glci3
+            )
+            from geometry import PoleSpec, Segment
+            from loads import Baseline, build_load_model, first_order_forces
+            import matplotlib.pyplot as plt
+            import numpy as np
+
+            p3      = _parse3(tmp_path3)
+            prop3   = _gst3(p3, 'steel_pole_properties')[0]
+            tubes3  = _gst3(p3, 'steel_tubes_properties')
+            conn3   = _gst3(p3, 'steel_pole_connectivity')
+            summ3   = _gst3(p3, 'summary_of_steel_pole_usages')[0]
+
+            # ---- Reconstruct PoleSpec ----
+            is_bp3 = str(prop3.get('base_plate', '')).lower() == 'yes'
+            emb3   = 0.0
+            if not is_bp3 and conn3:
+                emb3 = _gf3(conn3[0], 'embed_override') or \
+                       _gf3(prop3, 'default_embedded_length') or 0.0
+            segs3 = []
+            for t in tubes3:
+                lap = _gf3(t, 'lap_length') or 0.0
+                segs3.append(Segment(
+                    length=_gf3(t, 'length'),
+                    thickness=_gf3(t, 'thickness'),
+                    fy=_gf3(t, 'yield_stress') or 65.0,
+                    joint_type='slip' if lap > 0 else 'flange',
+                ))
+            spec3 = PoleSpec(
+                label=prop3.get('steel_pole_property_label', ''),
+                tip_diameter=_gf3(prop3, 'tip_diameter'),
+                taper=_gf3(tubes3[0], 'calculated_taper'),
+                segments=segs3,
+                embedment=emb3,
+            )
+
+            # ---- Baseline and load case list ----
+            base3    = Baseline.from_xml(tmp_path3)
+            all_cases = list(base3.load_cases.keys())
+            gov_case  = summ3.get('load_case', all_cases[0])
+
+            # Default index = governing case
+            default_idx = all_cases.index(gov_case) if gov_case in all_cases else 0
+            sel_case = st.selectbox(
+                "Load case",
+                all_cases,
+                index=default_idx,
+                help="Defaults to the governing case from PLS-POLE summary"
+            )
+            st.caption(f"Governing case per PLS-POLE: **{gov_case}**")
+
+            # ---- Build load model ----
+            m3  = build_load_model(spec3, base3, sel_case, ds=0.25)
+            lc3 = m3.case
+
+            # ---- Load case parameters ----
+            st.subheader("Load case parameters")
+            lp1, lp2, lp3, lp4, lp5 = st.columns(5)
+            lp1.metric("DLF",          f"{lc3.dlf:.2f}")
+            lp2.metric("q trans (psf)", f"{lc3.q_trans:.1f}")
+            lp3.metric("q long (psf)",  f"{lc3.q_long:.1f}")
+            lp4.metric("Ice t (in)",    f"{lc3.ice_t:.3f}")
+            lp5.metric("Ice density",   f"{lc3.ice_density:.0f} pcf")
+
+            # ---- Base reactions (first-order) ----
+            st.subheader("Base reactions — first-order (no P-delta)")
+            fo = first_order_forces(m3, spec3.total_length - 1e-9)
+            br1, br2, br3, br4, br5, br6 = st.columns(6)
+            br1.metric("P (kips)",  f"{fo['P']:+.3f}")
+            br2.metric("Vx (kips)", f"{fo['Vx']:+.3f}")
+            br3.metric("Vy (kips)", f"{fo['Vy']:+.3f}")
+            br4.metric("Mx (ft-k)", f"{fo['Mx']:+.1f}")
+            br5.metric("My (ft-k)", f"{fo['My']:+.1f}")
+            br6.metric("T (ft-k)",  f"{fo['T']:+.3f}")
+
+            # ---- Point loads at attachments ----
+            st.subheader("Point loads at attachment points")
+            if m3.points:
+                pt_rows = []
+                for pl in sorted(m3.points, key=lambda x: x.s):
+                    pt_rows.append({
+                        "label":       pl.label,
+                        "s (ft)":      round(pl.s, 3),
+                        "ht AGL (ft)": round(m3.z_of(pl.s), 3),
+                        "dx (ft)":     round(pl.dx, 3),
+                        "dy (ft)":     round(pl.dy, 3),
+                        "dz (ft)":     round(pl.dz, 3),
+                        "Fx (kips)":   round(pl.Fx, 4),
+                        "Fy (kips)":   round(pl.Fy, 4),
+                        "Fz (kips)":   round(pl.Fz, 4),
+                    })
+                st.dataframe(pd.DataFrame(pt_rows), use_container_width=True, hide_index=True)
+
+                # Totals
+                tot_Fx = sum(pl.Fx for pl in m3.points)
+                tot_Fy = sum(pl.Fy for pl in m3.points)
+                tot_Fz = sum(pl.Fz for pl in m3.points)
+                tc1, tc2, tc3 = st.columns(3)
+                tc1.metric("∑ Fx attachment (kips)", f"{tot_Fx:+.3f}")
+                tc2.metric("∑ Fy attachment (kips)", f"{tot_Fy:+.3f}")
+                tc3.metric("∑ Fz attachment (kips)", f"{tot_Fz:+.3f}")
+            else:
+                st.info("No attachment point loads for this load case.")
+
+            # ---- Per-element shaft loads ----
+            st.subheader("Shaft element loads")
+            el_rows = []
+            for e in m3.elements:
+                el_rows.append({
+                    "s_top (ft)":    round(e.s_top, 3),
+                    "s_bot (ft)":    round(e.s_bot, 3),
+                    "ht AGL (ft)":   round(m3.z_of(e.s_mid), 3),
+                    "above GL":      e.above_ground,
+                    "D_wind (in)":   round(e.D_wind, 3),
+                    "D_out (in)":    round(e.D_out, 3),
+                    "Fy wind (k)":   round(e.fy, 5),
+                    "Fx wind (k)":   round(e.fx, 5),
+                    "Fz DL+ice (k)": round(e.fz, 5),
+                })
+            df_el = pd.DataFrame(el_rows)
+            st.dataframe(df_el, use_container_width=True, hide_index=True)
+
+            # Element load totals
+            tot_fy_shaft = sum(e.fy for e in m3.elements)
+            tot_fx_shaft = sum(e.fx for e in m3.elements)
+            tot_fz_shaft = sum(e.fz for e in m3.elements)
+            sc1, sc2, sc3 = st.columns(3)
+            sc1.metric("∑ Fy shaft wind (kips)",   f"{tot_fy_shaft:+.3f}")
+            sc2.metric("∑ Fx shaft wind (kips)",   f"{tot_fx_shaft:+.3f}")
+            sc3.metric("∑ Fz shaft DL+ice (kips)", f"{tot_fz_shaft:+.3f}")
+
+            # ---- Load distribution plots ----
+            st.subheader("Load distribution along shaft")
+            above_els = [e for e in m3.elements if e.above_ground]
+            hts  = [m3.z_of(e.s_mid) for e in above_els]
+            fyw  = [e.fy * 1000 for e in above_els]   # kips -> lbs for clarity
+            fzw  = [e.fz * 1000 for e in above_els]
+
+            fig3, (ax3a, ax3b) = plt.subplots(1, 2, figsize=(10, 5))
+
+            ax3a.barh(hts, fyw, height=0.2, color='steelblue', label='Trans wind (lb)')
+            ax3a.axhline(0, color='brown', linestyle='--', linewidth=1, label='Ground line')
+            ax3a.set_xlabel("Transverse wind load per element (lb)")
+            ax3a.set_ylabel("Height above ground line (ft)")
+            ax3a.set_title("Shaft transverse wind")
+            ax3a.legend(fontsize=8)
+            ax3a.grid(True, alpha=0.3)
+
+            ax3b.barh(hts, fzw, height=0.2, color='darkorange', label='DL + ice (lb)')
+            ax3b.axhline(0, color='brown', linestyle='--', linewidth=1, label='Ground line')
+            ax3b.set_xlabel("Vertical load per element (lb)")
+            ax3b.set_ylabel("Height above ground line (ft)")
+            ax3b.set_title("Shaft self-weight + ice")
+            ax3b.legend(fontsize=8)
+            ax3b.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            st.pyplot(fig3)
+            plt.close(fig3)
+
+            # ---- First-order moment diagram ----
+            st.subheader("First-order moment diagram (transverse)")
+            s_vals = np.linspace(0, spec3.groundline_rel, 60)
+            mx_vals = [first_order_forces(m3, s)['Mx'] for s in s_vals]
+            ht_vals = [m3.z_of(s) for s in s_vals]
+
+            fig4, ax4 = plt.subplots(figsize=(7, 5))
+            ax4.plot(mx_vals, ht_vals, color='steelblue', linewidth=2)
+            ax4.axhline(0, color='brown', linestyle='--', linewidth=1, label='Ground line')
+            ax4.axvline(0, color='gray', linewidth=0.5)
+            ax4.fill_betweenx(ht_vals, mx_vals, 0, alpha=0.15, color='steelblue')
+            ax4.set_xlabel("First-order Mx (ft-kips)")
+            ax4.set_ylabel("Height above ground line (ft)")
+            ax4.set_title(f"Transverse moment diagram — {sel_case}")
+            ax4.legend()
+            ax4.grid(True, alpha=0.3)
+            st.pyplot(fig4)
+            plt.close(fig4)
+
+        except Exception as e:
+            st.error(f"Error: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+        finally:
+            os.unlink(tmp_path3)
+    else:
+        st.info("Upload a PLS-POLE XML file to begin.")
 
 with tab4:
     st.header("ASCE 48-19 Strength Check")
