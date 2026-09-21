@@ -494,7 +494,17 @@ with tab4:
             m4  = _blm4(spec4, base4, sel_case4, ds=0.25)
             lc4 = m4.case
 
-            usages4   = _glci4(p4, 'detailed_steel_pole_usages')
+            usages4 = _glci4(p4, 'detailed_steel_pole_usages')
+
+            # Debug: show available keys in both dicts
+            with st.expander("🔍 Debug: load case key matching"):
+                st.write("**Keys in vector_load_cases (dropdown source):**")
+                st.write(all_cases4)
+                st.write("**Keys in detailed_steel_pole_usages:**")
+                st.write(list(usages4.keys()))
+                st.write(f"**Selected case:** `{sel_case4}`")
+                st.write(f"**Match found:** {sel_case4 in usages4}")
+
             pls_rows4 = sorted(usages4.get(sel_case4, []),
                                key=lambda r: _gf4(r, 'rel_dist'))
 
