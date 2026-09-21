@@ -418,10 +418,297 @@ with tab3:
             import traceback
             st.code(traceback.format_exc())
 
-# ── TABS 4-5: COMING SOON ──────────────────────────────────────────────────
+# ── TAB 4: ASCE 48-19 STRENGTH CHECK ──────────────────────────────────────
 with tab4:
     st.header("ASCE 48-19 Strength Check")
-    st.info("🚧 Coming soon — mechanics_engine.py UI")
+    if not tmp_path:
+        st.info("Upload a PLS-POLE XML file in the sidebar to begin.")
+    else:
+        try:
+            from pls_pole_xml_parser import (
+                parse_pls_pole_xml as _parse4, get_single_table as _gst4,
+                get_field as _gf4, get_load_case_instances as _glci4
+            )
+            from geometry import PoleSpec as _PS4, Segment as _Seg4, build_sections as _bs4
+            from loads import Baseline as _BL4, build_load_model as _blm4, first_order_forces as _fof4
+            from mechanics_engine import combined_stress_check
+            import matplotlib.pyplot as plt
+            import numpy as np
+
+            p4     = _parse4(tmp_path)
+            prop4  = _gst4(p4, 'steel_pole_properties')[0]
+            tubes4 = _gst4(p4, 'steel_tubes_properties')
+            conn4  = _gst4(p4, 'steel_pole_connectivity')
+            summ4  = _gst4(p4, 'summary_of_steel_pole_usages')[0]
+
+            # ---- Reconstruct PoleSpec ----
+            is_bp4 = str(prop4.get('base_plate', '')).lower() == 'yes'
+            emb4   = 0.0
+            if not is_bp4 and conn4:
+                emb4 = _gf4(conn4[0], 'embed_override') or \
+                       _gf4(prop4, 'default_embedded_length') or 0.0
+            segs4 = []
+            for t in tubes4:
+                lap = _gf4(t, 'lap_length') or 0.0
+                segs4.append(_Seg4(
+                    length=_gf4(t, 'length'),
+                    thickness=_gf4(t, 'thickness'),
+                    fy=_gf4(t, 'yield_stress') or 65.0,
+                    joint_type='slip' if lap > 0 else 'flange',
+                ))
+            spec4 = _PS4(
+                label=prop4.get('steel_pole_property_label', ''),
+                tip_diameter=_gf4(prop4, 'tip_diameter'),
+                taper=_gf4(tubes4[0], 'calculated_taper'),
+                segments=segs4,
+                embedment=emb4,
+            )
+            base4     = _BL4.from_xml(tmp_path)
+            all_cases4 = list(base4.load_cases.keys())
+            gov_case4  = summ4.get('load_case', all_cases4[0])
+            default_idx4 = all_cases4.index(gov_case4) if gov_case4 in all_cases4 else 0
+
+            # ---- Controls ----
+            col_a, col_b = st.columns([2, 1])
+            with col_a:
+                sel_case4 = st.selectbox("Load case", all_cases4, index=default_idx4,
+                                         key="lc4",
+                                         help="Defaults to governing case from PLS-POLE summary")
+                st.caption(f"Governing case per PLS-POLE: **{gov_case4}**")
+            with col_b:
+                section_mode = st.radio("Section points", ["PLS-POLE points", "Custom spacing"],
+                                        key="secmode4")
+                if section_mode == "Custom spacing":
+                    chk_spacing = st.slider("Spacing (ft)", 1.0, 10.0, 5.0, 0.5, key="sp4")
+
+            shear_mode4 = st.radio(
+                "Shear mode",
+                ["transverse_only", "resultant"],
+                index=0,
+                horizontal=True,
+                help="'transverse_only' matches PLS-POLE calibration. "
+                     "'resultant' is the textbook interpretation.",
+                key="shear4"
+            )
+
+            # ---- Build load model ----
+            m4  = _blm4(spec4, base4, sel_case4, ds=0.25)
+            lc4 = m4.case
+
+            # ---- Determine section points ----
+            usages4 = _glci4(p4, 'detailed_steel_pole_usages')
+            pls_rows4 = sorted(usages4.get(sel_case4, []), key=lambda r: _gf4(r, 'rel_dist'))
+
+            if section_mode == "PLS-POLE points":
+                # Use PLS-POLE rel_dist values directly
+                check_pts = []
+                for r in pls_rows4:
+                    rd  = _gf4(r, 'rel_dist')
+                    D   = _gf4(r, 'outer_diameter')
+                    wt  = _gf4(r, 'w_t_max') or 0.0
+                    # Recover thickness from w/t and D
+                    from geometry import thickness_from_wt as _tfw
+                    t   = _tfw(D, wt) if wt > 0 else spec4.thickness_at(rd)
+                    fy  = next((_gf4(tb, 'yield_stress') for tb in tubes4
+                                if abs(_gf4(tb, 'tube_no') -
+                                       next((i+1 for i, tb2 in enumerate(spec4.layout())
+                                             if tb2['start']-1e-6 <= rd <= tb2['end']+1e-6),
+                                            1)) < 0.5), 65.0)
+                    check_pts.append({
+                        'rd': rd,
+                        'D': D,
+                        't': t,
+                        'wt': wt,
+                        'fy': fy,
+                        'pls_usage': _gf4(r, 'max_usage'),
+                        'pls_pa':    _gf4(r, 'p_a'),
+                        'pls_ms':    _gf4(r, 'm_s'),
+                        'pls_vq':    _gf4(r, 'v_q'),
+                        'pls_tr':    _gf4(r, 't_r'),
+                        'pls_res':   _gf4(r, 'res'),
+                        'pls_Fa':    _gf4(r, 'fa_min'),
+                        'joint_pos': r.get('joint_position', ''),
+                        'P':   _gf4(r, 'axial_force') or 0.0,
+                        'Mx':  _gf4(r, 'trans_mom_local_mx') or 0.0,
+                        'My':  _gf4(r, 'long_mom_local_my') or 0.0,
+                        'Vt':  _gf4(r, 'tran_shear') or 0.0,
+                        'Vl':  _gf4(r, 'long_shear') or 0.0,
+                        'T':   _gf4(r, 'tors_mom') or 0.0,
+                    })
+            else:
+                # Custom spacing — forces from first_order_forces, no PLS comparison
+                from geometry import build_sections as _bs4c, thickness_from_wt as _tfw4c
+                secs4c = _bs4c(spec4, spacing=chk_spacing)
+                check_pts = []
+                for s in secs4c:
+                    if s['below_groundline']:
+                        continue
+                    rd  = s['rel_dist']
+                    fo4 = _fof4(m4, rd)
+                    check_pts.append({
+                        'rd':  rd,
+                        'D':   s['D'],
+                        't':   s['t'],
+                        'wt':  s['w_over_t'],
+                        'fy':  s['fy'],
+                        'pls_usage': None,
+                        'pls_pa': None, 'pls_ms': None,
+                        'pls_vq': None, 'pls_tr': None,
+                        'pls_res': None, 'pls_Fa': None,
+                        'joint_pos': '',
+                        'P':  fo4['P'],
+                        'Mx': fo4['Mx'],
+                        'My': fo4['My'],
+                        'Vt': fo4['Vy'],
+                        'Vl': fo4['Vx'],
+                        'T':  fo4['T'],
+                    })
+
+            # ---- Run strength check ----
+            results4 = []
+            for cp in check_pts:
+                if not cp['D'] or not cp['t'] or cp['t'] <= 0:
+                    continue
+                chk = combined_stress_check(
+                    P=cp['P'], Mx=cp['Mx'], My=cp['My'],
+                    V_tran=cp['Vt'], V_long=cp['Vl'], Torsion_ftk=cp['T'],
+                    D=cp['D'], t=cp['t'], Fy=cp['fy'], w_over_t=cp['wt'],
+                    shear_mode=shear_mode4
+                )
+                ht = m4.z_of(cp['rd'])
+                results4.append({
+                    'rel_dist (ft)':  round(cp['rd'], 3),
+                    'ht AGL (ft)':    round(ht, 3),
+                    'joint_pos':      cp['joint_pos'],
+                    'D (in)':         round(cp['D'], 3),
+                    't (in)':         round(cp['t'], 4),
+                    'w/t':            round(cp['wt'], 2),
+                    'Fy (ksi)':       cp['fy'],
+                    'Fa (ksi)':       round(chk['Fa'], 3) if chk['Fa'] else None,
+                    'Fa eq':          chk['Fa_equation'],
+                    'p_a (ksi)':      round(chk['p_a'], 4),
+                    'm_s (ksi)':      round(chk['m_s'], 4),
+                    'v_q (ksi)':      round(chk['v_q'], 4),
+                    't_r (ksi)':      round(chk['t_r'], 4),
+                    'res (ksi)':      round(chk['res'], 4),
+                    'calc usage %':   round(chk['usage'], 2) if chk['usage'] else None,
+                    'PLS usage %':    round(cp['pls_usage'], 2) if cp['pls_usage'] else None,
+                    'diff (pts)':     round(chk['usage'] - cp['pls_usage'], 2)
+                                      if (chk['usage'] and cp['pls_usage']) else None,
+                    'PLS p_a':        cp['pls_pa'],
+                    'PLS m_s':        cp['pls_ms'],
+                    'PLS v_q':        cp['pls_vq'],
+                    'PLS t_r':        cp['pls_tr'],
+                    'PLS res':        cp['pls_res'],
+                    'PLS Fa':         cp['pls_Fa'],
+                })
+
+            df4 = pd.DataFrame(results4)
+
+            # ---- Governing result ----
+            if not df4.empty and df4['calc usage %'].notna().any():
+                gov_row = df4.loc[df4['calc usage %'].idxmax()]
+                st.subheader("Governing section")
+                g1, g2, g3, g4c, g5 = st.columns(5)
+                g1.metric("Max usage",    f"{gov_row['calc usage %']:.2f}%")
+                g2.metric("At ht AGL",   f"{gov_row['ht AGL (ft)']:.2f} ft")
+                g3.metric("D / t",       f"{gov_row['D (in)']:.2f} / {gov_row['t (in)']:.4f}")
+                g4c.metric("Fa (ksi)",   f"{gov_row['Fa (ksi)']:.3f}")
+                g5.metric("Fa equation", str(gov_row['Fa eq']))
+
+                if gov_row['PLS usage %']:
+                    d1, d2 = st.columns(2)
+                    d1.metric("PLS-POLE usage at same point",
+                              f"{gov_row['PLS usage %']:.2f}%")
+                    d2.metric("Difference",
+                              f"{gov_row['diff (pts)']:+.2f} pts")
+
+            # ---- Full results table ----
+            st.subheader("Full section check results")
+            display_cols = ['rel_dist (ft)', 'ht AGL (ft)', 'D (in)', 't (in)',
+                            'w/t', 'Fa (ksi)', 'p_a (ksi)', 'm_s (ksi)',
+                            'v_q (ksi)', 't_r (ksi)', 'res (ksi)',
+                            'calc usage %', 'PLS usage %', 'diff (pts)']
+            st.dataframe(df4[display_cols], use_container_width=True, hide_index=True)
+
+            # ---- Usage profile plot ----
+            st.subheader("Usage % vs height")
+            fig4a, ax4a = plt.subplots(figsize=(7, 6))
+            valid = df4[df4['calc usage %'].notna()]
+            ax4a.plot(valid['calc usage %'], valid['ht AGL (ft)'],
+                      color='steelblue', linewidth=2, label='Calc (this engine)')
+            if valid['PLS usage %'].notna().any():
+                ax4a.plot(valid['PLS usage %'], valid['ht AGL (ft)'],
+                          color='darkorange', linewidth=1.5, linestyle='--',
+                          label='PLS-POLE reported')
+            ax4a.axvline(100, color='red', linestyle='--', linewidth=1, label='100% limit')
+            ax4a.axhline(0, color='brown', linestyle='--', linewidth=1, label='Ground line')
+            ax4a.set_xlabel("Usage (%)")
+            ax4a.set_ylabel("Height above ground line (ft)")
+            ax4a.set_title(f"Usage profile — {sel_case4}")
+            ax4a.legend(); ax4a.grid(True, alpha=0.3)
+            st.pyplot(fig4a); plt.close(fig4a)
+
+            # ---- Stress component comparison plot ----
+            st.subheader("Stress components vs height")
+            fig4b, ax4b = plt.subplots(figsize=(7, 6))
+            ax4b.plot(valid['p_a (ksi)'],  valid['ht AGL (ft)'], label='p_a', linewidth=1.5)
+            ax4b.plot(valid['m_s (ksi)'],  valid['ht AGL (ft)'], label='m_s', linewidth=1.5)
+            ax4b.plot(valid['v_q (ksi)'],  valid['ht AGL (ft)'], label='v_q', linewidth=1.5)
+            ax4b.plot(valid['t_r (ksi)'],  valid['ht AGL (ft)'], label='t_r', linewidth=1.5)
+            ax4b.plot(valid['res (ksi)'],  valid['ht AGL (ft)'], label='resultant',
+                      linewidth=2, color='black', linestyle='--')
+            ax4b.axhline(0, color='brown', linestyle='--', linewidth=1, label='Ground line')
+            ax4b.set_xlabel("Stress (ksi)")
+            ax4b.set_ylabel("Height above ground line (ft)")
+            ax4b.set_title(f"Stress components — {sel_case4}")
+            ax4b.legend(fontsize=8); ax4b.grid(True, alpha=0.3)
+            st.pyplot(fig4b); plt.close(fig4b)
+
+            # ---- Engine vs PLS-POLE difference plot ----
+            if section_mode == "PLS-POLE points":
+                diff_valid = df4[df4['diff (pts)'].notna()]
+                if not diff_valid.empty:
+                    st.subheader("Engine vs PLS-POLE usage difference")
+                    fig4c, ax4c = plt.subplots(figsize=(7, 5))
+                    colors = ['red' if abs(d) > 2 else 'steelblue'
+                              for d in diff_valid['diff (pts)']]
+                    ax4c.barh(diff_valid['ht AGL (ft)'], diff_valid['diff (pts)'],
+                              height=0.4, color=colors)
+                    ax4c.axvline(0,  color='black', linewidth=0.8)
+                    ax4c.axvline(2,  color='red', linestyle='--', linewidth=0.8, label='±2 pt band')
+                    ax4c.axvline(-2, color='red', linestyle='--', linewidth=0.8)
+                    ax4c.axhline(0,  color='brown', linestyle='--', linewidth=1, label='Ground line')
+                    ax4c.set_xlabel("Calc usage % − PLS usage % (percentage points)")
+                    ax4c.set_ylabel("Height above ground line (ft)")
+                    ax4c.set_title(f"Engine vs PLS-POLE difference — {sel_case4}")
+                    ax4c.legend(fontsize=8); ax4c.grid(True, alpha=0.3)
+                    st.pyplot(fig4c); plt.close(fig4c)
+
+                    # Difference statistics
+                    diffs = diff_valid['diff (pts)']
+                    st1, st2, st3, st4s = st.columns(4)
+                    st1.metric("Mean diff",    f"{diffs.mean():+.3f} pts")
+                    st2.metric("Max |diff|",   f"{diffs.abs().max():.3f} pts")
+                    st3.metric("Std dev",      f"{diffs.std():.3f} pts")
+                    st4s.metric("Points > ±2", f"{(diffs.abs() > 2).sum()}")
+
+            # ---- Detailed component comparison table ----
+            with st.expander("Detailed component comparison (calc vs PLS-POLE)"):
+                comp_cols = ['rel_dist (ft)', 'ht AGL (ft)',
+                             'p_a (ksi)', 'PLS p_a',
+                             'm_s (ksi)', 'PLS m_s',
+                             'v_q (ksi)', 'PLS v_q',
+                             't_r (ksi)', 'PLS t_r',
+                             'res (ksi)', 'PLS res',
+                             'Fa (ksi)',  'PLS Fa',
+                             'calc usage %', 'PLS usage %', 'diff (pts)']
+                st.dataframe(df4[comp_cols], use_container_width=True, hide_index=True)
+
+        except Exception as e:
+            st.error(f"Error: {e}")
+            import traceback
+            st.code(traceback.format_exc())
 
 with tab5:
     st.header("Minimum-Weight Optimizer")
