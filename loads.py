@@ -34,11 +34,7 @@ PLS-POLE conventions reproduced (verified on 003, see test_loads_003.py)
 Open items (flagged, not resolved)
     * Davit arm self-weight (~0.18 kips total in 003) and arm wind are not
       modelled. Symmetric left/right in 003; residual <= ~0.5 ft-k.
-      (The other ~1.8 kips of non-wire vertical reaction in 003 is the
-      base plate, 1,806 lb, which sits below the pole and does not load it.)
-      Post insulator self-weight does not appear in the PLS load path.
-    * Post insulator T/B load split is held at the baseline values. In
-      reality it shifts slightly when the pole face moves with D.
+    * Post insulator T/B load split is held at the baseline values.
     * Arm flexibility is ignored (arms treated as rigid offsets).
     * Vangs attached to an arm joint are taken as hanging vertically by
       (vang length + arm tip depth/2), inferred from 003 positions.
@@ -48,6 +44,7 @@ Open items (flagged, not resolved)
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -93,10 +90,8 @@ class Baseline:
     cd_pole: float
     load_cases: Dict[str, LoadCase]
     attach: Dict[str, AttachPoint]
-    #: load case -> list of (attach label, Fx, Fy, Fz_down)
     attach_loads: Dict[str, List[Tuple[str, float, float, float]]]
 
-    # ---------------------------------------------------------------
     @classmethod
     def from_xml(cls, path: str) -> 'Baseline':
         p = parse_pls_pole_xml(path)
@@ -131,7 +126,7 @@ class Baseline:
                 pole_s[r['joint_label']] = g(r, 'distance_from_origin_top_joint')
         pole_s.setdefault('P:t', 0.0)
 
-        # davit property intermediate joints: prop -> {joint: (horz, vert)}
+        # davit property intermediate joints
         dprops = {}
         for inst in p['tables'].get('intermediate_joints', []):
             name = inst['titledetail'].split('"')[1] if '"' in inst['titledetail'] else ''
@@ -141,20 +136,20 @@ class Baseline:
                            for r in get_single_table(p, 'tubular_davit_properties')} \
             if 'tubular_davit_properties' in p['tables'] else {}
 
-        # resolve any joint label to (s_pole, extra_horz, dz, azimuth)
         davits = {r['davit_label']: r for r in
                   get_single_table(p, 'tubular_davit_arm_connectivity')} \
             if 'tubular_davit_arm_connectivity' in p['tables'] else {}
 
-                def resolve(label: str) -> Tuple[float, float, float, float]:
+        def resolve(label: str) -> Tuple[float, float, float, float]:
             if label in pole_s:
                 return pole_s[label], 0.0, 0.0, 0.0
             davit, _, jt = label.partition(':')
             if davit not in davits:
-                import warnings
-                warnings.warn(f"resolve(): label '{label}' not found in pole joints "
-                              f"or davit table — defaulting to tip (s=0). "
-                              f"Check vang/attachment connectivity in the XML.")
+                warnings.warn(
+                    f"resolve(): label '{label}' not found in pole joints "
+                    f"or davit table — defaulting to tip (s=0). "
+                    f"Check vang/attachment connectivity in the XML."
+                )
                 return 0.0, 0.0, 0.0, 0.0
             d = davits[davit]
             s, h, dz, az = resolve(d['attach_label'])
@@ -170,10 +165,10 @@ class Baseline:
                   if 'vang_connectivity' in p['tables'] else []):
             s, h, dz, az = resolve(r['attach_label'])
             L = g(r, 'length')
-            if r['attach_label'] in pole_s:            # on pole face, radial
+            if r['attach_label'] in pole_s:
                 attach[r['vang_label']] = AttachPoint(r['vang_label'], s, h + L, dz,
                                                       g(r, 'azimuth'))
-            else:                                       # on an arm: hangs down
+            else:
                 prop_set = davits[r['attach_label'].split(':')[0]]['davit_property_set']
                 depth = (dprop_tip_depth.get(prop_set) or 0.0) / 12.0
                 attach[r['vang_label']] = AttachPoint(r['vang_label'], s, h,
@@ -203,13 +198,13 @@ class Baseline:
 class Element:
     s_top: float
     s_bot: float
-    D_wind: float           # in, projected width (mean D inside a lap)
-    D_out: float            # in, outside (female) diameter
-    area: float             # in^2, sum of tube areas present
-    tubes: List[Tuple[float, float]]   # (D_out, t) of every tube present
-    fy: float               # kips, transverse wind (element total)
-    fx: float               # kips, longitudinal wind
-    fz: float               # kips, downward (self weight*DLF + ice)
+    D_wind: float
+    D_out: float
+    area: float
+    tubes: List[Tuple[float, float]]
+    fy: float
+    fx: float
+    fz: float
     above_ground: bool
 
     @property
@@ -220,13 +215,13 @@ class Element:
 @dataclass
 class PointLoad:
     label: str
-    s: float                # ft below tip (pole attachment point)
-    dx: float               # ft offset from pole centreline (undeformed)
+    s: float
+    dx: float
     dy: float
-    dz: float               # ft, + up
+    dz: float
     Fx: float
     Fy: float
-    Fz: float               # + down
+    Fz: float
 
 
 @dataclass
@@ -238,7 +233,6 @@ class LoadModel:
     points: List[PointLoad]
 
     def z_of(self, s: float) -> float:
-        """Elevation above ground line of a point s ft below the tip."""
         return self.total_length - self.spec.embedment - s
 
 
@@ -278,7 +272,7 @@ def build_load_model(spec: PoleSpec, base: Baseline, case_name: str,
     pts = []
     for lab, Fx, Fy, Fz in base.attach_loads.get(case_name, []):
         a = base.attach[lab]
-        r = spec.diameter_at(a.s_pole) / 24.0 + a.extra_horz   # face + offsets
+        r = spec.diameter_at(a.s_pole) / 24.0 + a.extra_horz
         az = math.radians(a.azimuth)
         pts.append(PointLoad(lab, a.s_pole, r * math.sin(az), r * math.cos(az),
                              a.dz, Fx, Fy, Fz))
