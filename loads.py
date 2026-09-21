@@ -34,7 +34,11 @@ PLS-POLE conventions reproduced (verified on 003, see test_loads_003.py)
 Open items (flagged, not resolved)
     * Davit arm self-weight (~0.18 kips total in 003) and arm wind are not
       modelled. Symmetric left/right in 003; residual <= ~0.5 ft-k.
-    * Post insulator T/B load split is held at the baseline values.
+      (The other ~1.8 kips of non-wire vertical reaction in 003 is the
+      base plate, 1,806 lb, which sits below the pole and does not load it.)
+      Post insulator self-weight does not appear in the PLS load path.
+    * Post insulator T/B load split is held at the baseline values. In
+      reality it shifts slightly when the pole face moves with D.
     * Arm flexibility is ignored (arms treated as rigid offsets).
     * Vangs attached to an arm joint are taken as hanging vertically by
       (vang length + arm tip depth/2), inferred from 003 positions.
@@ -90,8 +94,12 @@ class Baseline:
     cd_pole: float
     load_cases: Dict[str, LoadCase]
     attach: Dict[str, AttachPoint]
+    #: load case -> list of (attach label, Fx, Fy, Fz_down)
     attach_loads: Dict[str, List[Tuple[str, float, float, float]]]
+    #: davit arm self-weight: (label, AttachPoint at arm centroid, weight kips)
+    davit_weights: List[Tuple[str, 'AttachPoint', float]] = field(default_factory=list)
 
+    # ---------------------------------------------------------------
     @classmethod
     def from_xml(cls, path: str) -> 'Baseline':
         p = parse_pls_pole_xml(path)
@@ -126,7 +134,7 @@ class Baseline:
                 pole_s[r['joint_label']] = g(r, 'distance_from_origin_top_joint')
         pole_s.setdefault('P:t', 0.0)
 
-        # davit property intermediate joints
+        # davit property intermediate joints: prop -> {joint: (horz, vert)}
         dprops = {}
         for inst in p['tables'].get('intermediate_joints', []):
             name = inst['titledetail'].split('"')[1] if '"' in inst['titledetail'] else ''
@@ -136,6 +144,7 @@ class Baseline:
                            for r in get_single_table(p, 'tubular_davit_properties')} \
             if 'tubular_davit_properties' in p['tables'] else {}
 
+        # resolve any joint label to (s_pole, extra_horz, dz, azimuth)
         davits = {r['davit_label']: r for r in
                   get_single_table(p, 'tubular_davit_arm_connectivity')} \
             if 'tubular_davit_arm_connectivity' in p['tables'] else {}
@@ -145,11 +154,8 @@ class Baseline:
                 return pole_s[label], 0.0, 0.0, 0.0
             davit, _, jt = label.partition(':')
             if davit not in davits:
-                warnings.warn(
-                    f"resolve(): label '{label}' not found in pole joints "
-                    f"or davit table — defaulting to tip (s=0). "
-                    f"Check vang/attachment connectivity in the XML."
-                )
+                warnings.warn(f"resolve(): label '{label}' not found in pole joints "
+                              f"or davit table -- defaulting to tip (s=0).")
                 return 0.0, 0.0, 0.0, 0.0
             d = davits[davit]
             s, h, dz, az = resolve(d['attach_label'])
@@ -158,6 +164,8 @@ class Baseline:
             if jt in ('O', ''):
                 return s, h, dz, az
             dh, dv = dprops[d['davit_property_set']][jt]
+            # PLS davit 'vert_offset' is positive DOWNWARD (verified on 003:
+            # DA1 tip at vert_offset -0.5 sits 0.5 ft ABOVE the arm origin).
             return s, h + dh, dz - dv, az
 
         attach = {}
@@ -165,10 +173,10 @@ class Baseline:
                   if 'vang_connectivity' in p['tables'] else []):
             s, h, dz, az = resolve(r['attach_label'])
             L = g(r, 'length')
-            if r['attach_label'] in pole_s:
+            if r['attach_label'] in pole_s:            # on pole face, radial
                 attach[r['vang_label']] = AttachPoint(r['vang_label'], s, h + L, dz,
                                                       g(r, 'azimuth'))
-            else:
+            else:                                       # on an arm: hangs down
                 prop_set = davits[r['attach_label'].split(':')[0]]['davit_property_set']
                 depth = (dprop_tip_depth.get(prop_set) or 0.0) / 12.0
                 attach[r['vang_label']] = AttachPoint(r['vang_label'], s, h,
@@ -186,8 +194,32 @@ class Baseline:
                 s, h, dz, az = resolve(lab)
                 attach[lab] = AttachPoint(lab, s, h, dz, az)
 
+        # Davit arm self-weight, as reported by PLS-POLE, applied at the arm
+        # centroid (midpoint of arm origin and its outermost joint), x DLF.
+        dw = []
+        wts = {}
+        if 'summary_of_tubular_davit_usages' in p['tables']:
+            wts = {r['tubular_davit_label']: (g(r, 'weight') or 0.0) / 1000.0
+                   for r in get_single_table(p, 'summary_of_tubular_davit_usages')}
+        for lab, d in davits.items():
+            w = wts.get(lab, 0.0)
+            if not w:
+                continue
+            s0, h0, dz0, az0 = resolve(d['attach_label'])
+            if h0 == 0.0 and dz0 == 0.0:
+                az0 = g(d, 'azimuth')
+            jts = dprops.get(d['davit_property_set'], {})
+            if jts:
+                jt = max(jts, key=lambda k: abs(jts[k][0]))
+                s1, h1, dz1, _ = resolve(f"{lab}:{jt}")
+            else:
+                s1, h1, dz1 = s0, h0, dz0
+            dw.append((lab, AttachPoint(f"davit:{lab}", s0, 0.5 * (h0 + h1),
+                                        0.5 * (dz0 + dz1), az0), w))
+
         return cls(source=path, total_length=length, embedment=emb, cd_pole=cd,
-                   load_cases=lcs, attach=attach, attach_loads=loads)
+                   load_cases=lcs, attach=attach, attach_loads=loads,
+                   davit_weights=dw)
 
 
 # --------------------------------------------------------------------------
@@ -198,13 +230,13 @@ class Baseline:
 class Element:
     s_top: float
     s_bot: float
-    D_wind: float
-    D_out: float
-    area: float
-    tubes: List[Tuple[float, float]]
-    fy: float
-    fx: float
-    fz: float
+    D_wind: float           # in, projected width (mean D inside a lap)
+    D_out: float            # in, outside (female) diameter
+    area: float             # in^2, sum of tube areas present
+    tubes: List[Tuple[float, float]]   # (D_out, t) of every tube present
+    fy: float               # kips, transverse wind (element total)
+    fx: float               # kips, longitudinal wind
+    fz: float               # kips, downward (self weight*DLF + ice)
     above_ground: bool
 
     @property
@@ -215,13 +247,13 @@ class Element:
 @dataclass
 class PointLoad:
     label: str
-    s: float
-    dx: float
+    s: float                # ft below tip (pole attachment point)
+    dx: float               # ft offset from pole centreline (undeformed)
     dy: float
-    dz: float
+    dz: float               # ft, + up
     Fx: float
     Fy: float
-    Fz: float
+    Fz: float               # + down
 
 
 @dataclass
@@ -233,6 +265,7 @@ class LoadModel:
     points: List[PointLoad]
 
     def z_of(self, s: float) -> float:
+        """Elevation above ground line of a point s ft below the tip."""
         return self.total_length - self.spec.embedment - s
 
 
@@ -272,10 +305,15 @@ def build_load_model(spec: PoleSpec, base: Baseline, case_name: str,
     pts = []
     for lab, Fx, Fy, Fz in base.attach_loads.get(case_name, []):
         a = base.attach[lab]
-        r = spec.diameter_at(a.s_pole) / 24.0 + a.extra_horz
+        r = spec.diameter_at(a.s_pole) / 24.0 + a.extra_horz   # face + offsets
         az = math.radians(a.azimuth)
         pts.append(PointLoad(lab, a.s_pole, r * math.sin(az), r * math.cos(az),
                              a.dz, Fx, Fy, Fz))
+    for lab, a, w in base.davit_weights:
+        r = spec.diameter_at(a.s_pole) / 24.0 + a.extra_horz
+        az = math.radians(a.azimuth)
+        pts.append(PointLoad(a.label, a.s_pole, r * math.sin(az), r * math.cos(az),
+                             a.dz, 0.0, 0.0, w * lc.dlf))
     return LoadModel(spec, lc, H, elems, pts)
 
 

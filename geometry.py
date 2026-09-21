@@ -151,6 +151,10 @@ class PoleSpec:
     embedment: float = 0.0            # ft; 0 for a base-plate pole. FIXED input.
     label: str = ''
     slip_clearance: float = SLIP_CLEARANCE_IN
+    #: lap = ceil(lap_factor * female_ID / lap_round) * lap_round
+    #: default 1.65 = 1.1 x 1.5
+    lap_factor: float = 1.65
+    lap_round: float = 0.25
 
     # ---- derived geometry -------------------------------------------------
 
@@ -178,7 +182,7 @@ class PoleSpec:
                 lap, joint = 0.0, 'none'
             elif seg.joint_type == 'slip':
                 female_id_ft = (d_bot - 2.0 * seg.thickness) / 12.0
-                lap, joint = slip_joint_lap(female_id_ft), 'slip'
+                lap, joint = slip_joint_lap(female_id_ft, self.lap_factor, self.lap_round), 'slip'
             else:
                 lap, joint = 0.0, seg.joint_type
 
@@ -273,12 +277,13 @@ class PoleSpec:
 # Rules
 # --------------------------------------------------------------------------
 
-def slip_joint_lap(female_id_ft: float) -> float:
-    """Design slip joint length = 1.1 x [1.5 x female ID], rounded UP to
-    the next 0.25 ft. Validated against 5 real joints."""
+def slip_joint_lap(female_id_ft: float, factor: float = 1.65,
+                   round_ft: float = 0.25) -> float:
+    """Design slip joint length = 1.1 x [1.5 x female ID] (factor 1.65),
+    rounded UP to the next 0.25 ft. Validated against 5 real joints."""
     if female_id_ft <= 0:
         return 0.0
-    return math.ceil(1.1 * 1.5 * female_id_ft / 0.25) * 0.25
+    return math.ceil(round(factor * female_id_ft / round_ft, 9)) * round_ft
 
 
 def snap_to_gauge(t: float, gauges=tuple(GAUGES), direction: str = 'up') -> float:

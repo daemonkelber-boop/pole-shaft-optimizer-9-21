@@ -617,4 +617,235 @@ with tab5:
 # ── TAB 6: OPTIMIZER ───────────────────────────────────────────────────────
 with tab6:
     st.header("Minimum-Weight Optimizer")
-    st.info("🚧 Next: greedy search, all load cases, strength + deflection.")
+    if not tmp_path:
+        st.info("Upload a PLS-POLE XML file in the sidebar to begin.")
+    else:
+        try:
+            import json, math as _m
+            from optimizer import Optimizer, OptConstraints, summarize, length_class
+            from weight import pole_weight as _pw
+
+            p6 = load_parsed(tmp_path)
+            spec6 = build_spec(p6)
+            base6 = load_baseline(tmp_path)
+            lay6 = spec6.layout()
+            n_j6 = len(lay6) - 1
+            half = lambda v: _m.floor(v * 2) / 2
+            # baseline joint types by position from bottom (1 = lowest joint)
+            base_joints = {n_j6 - k: lay6[k]['joint_type'] for k in range(n_j6)}
+            base_flange = ",".join(str(k) for k, v in sorted(base_joints.items()) if v == 'flange')
+
+            DEF = dict(
+                tip_min=10.0, tip_max=half(spec6.tip_diameter + 7), tip_inc=0.5,
+                base_min=half(max(spec6.base_diameter - 15, 20)), base_max=half(spec6.base_diameter + 10),
+                base_inc=0.5, t_mode="Min / max / increment", t_min=0.1875, t_max=1.0, t_inc=0.0625,
+                t_list="0.1875, 0.25, 0.3125, 0.375, 0.4375, 0.5", taper_min=0.15, taper_max=0.50,
+                max_wt=35.0, max_segments=6, len_preferred=53.0, len_normal_max=57.0,
+                len_special_max=60.0, min_tube=15.0, joint_default="slip",
+                flange_at=base_flange, slip_at="", lap_factor=1.65, lap_round=0.25,
+                slip_clearance=0.125, min_slip_above_gl=10.0, fy=65.0,
+                strength_target=100.0, defl_target=100.0, tie_band_pct=1.0,
+                n_alternates=10, log_all=False)
+            for k, v in DEF.items():
+                st.session_state.setdefault(f"o_{k}", v)
+            if st.button("↺ Reset all constraints to defaults"):
+                for k, v in DEF.items():
+                    st.session_state[f"o_{k}"] = v
+                st.rerun()
+
+            with st.form("opt_form"):
+                st.markdown("**Diameters and thickness** (0.5 in grid; tip and base stay on the grid, taper is derived)")
+                h = st.columns([1.3, 1, 1, 1])
+                h[1].markdown("Minimum"); h[2].markdown("Maximum"); h[3].markdown("Increment")
+                r = st.columns([1.3, 1, 1, 1]); r[0].markdown("Top diameter (in)")
+                r[1].number_input("tmin", key="o_tip_min", step=0.5, label_visibility="collapsed")
+                r[2].number_input("tmax", key="o_tip_max", step=0.5, label_visibility="collapsed")
+                r[3].number_input("tinc", key="o_tip_inc", step=0.5, label_visibility="collapsed")
+                r = st.columns([1.3, 1, 1, 1]); r[0].markdown("Bottom diameter (in)")
+                r[1].number_input("bmin", key="o_base_min", step=0.5, label_visibility="collapsed")
+                r[2].number_input("bmax", key="o_base_max", step=0.5, label_visibility="collapsed")
+                r[3].number_input("binc", key="o_base_inc", step=0.5, label_visibility="collapsed")
+                st.radio("Plate thicknesses to try", ["Min / max / increment", "User list only"],
+                         key="o_t_mode", horizontal=True)
+                r = st.columns([1.3, 1, 1, 1]); r[0].markdown("Thickness (in)")
+                r[1].number_input("thmin", key="o_t_min", step=0.0625, format="%.4f", label_visibility="collapsed")
+                r[2].number_input("thmax", key="o_t_max", step=0.0625, format="%.4f", label_visibility="collapsed")
+                r[3].number_input("thinc", key="o_t_inc", step=0.0625, format="%.4f", label_visibility="collapsed")
+                st.text_input("User thickness list (in, comma separated)", key="o_t_list")
+                r = st.columns(4)
+                r[0].number_input("Min taper (in/ft)", key="o_taper_min", step=0.01, format="%.4f")
+                r[1].number_input("Max taper (in/ft)", key="o_taper_max", step=0.01, format="%.4f")
+                r[2].number_input("Max w/t", key="o_max_wt", step=0.5)
+                r[3].number_input("Fy (ksi)", key="o_fy", step=5.0)
+
+                st.markdown("**Sections and joints**")
+                r = st.columns(5)
+                r[0].number_input("Max segments", key="o_max_segments", min_value=1, max_value=10, step=1)
+                r[1].number_input("Preferred length (ft)", key="o_len_preferred", step=0.25)
+                r[2].number_input("Normal max length (ft)", key="o_len_normal_max", step=0.25)
+                r[3].number_input("Special max length (ft)", key="o_len_special_max", step=0.25,
+                                  help="Lengths above the normal max are used only when they avoid an extra segment.")
+                r[4].number_input("Min tube length (ft)", key="o_min_tube", step=0.25)
+                r = st.columns(3)
+                r[0].radio("Default joint type", ["slip", "flange"], key="o_joint_default", horizontal=True)
+                r[1].text_input("Force FLANGE at joints (1 = lowest)", key="o_flange_at",
+                                help="Comma-separated positions counted from the bottom joint. "
+                                     "Pre-filled from the baseline.")
+                r[2].text_input("Force SLIP at joints (1 = lowest)", key="o_slip_at")
+                r = st.columns(4)
+                r[0].number_input("Lap factor (× female ID)", key="o_lap_factor", step=0.05, format="%.3f",
+                                  help="1.65 = 1.1 × 1.5")
+                r[1].number_input("Lap rounding up to (ft)", key="o_lap_round", step=0.25)
+                r[2].number_input("Slip clearance (in)", key="o_slip_clearance", step=0.0625, format="%.4f")
+                r[3].number_input("Lowest slip joint above GL (ft)", key="o_min_slip_above_gl", step=1.0)
+
+                st.markdown("**Acceptance and ranking**")
+                r = st.columns(5)
+                r[0].selectbox("Strength usage target (%)", [100.0, 95.0, 90.0, 85.0], key="o_strength_target")
+                r[1].number_input("Deflection target (% of XML limit)", key="o_defl_target", step=5.0)
+                r[2].number_input("Tie band (% of lightest)", key="o_tie_band_pct", step=0.5)
+                r[3].number_input("Alternates to report", key="o_n_alternates", min_value=0, max_value=30, step=1)
+                r[4].checkbox("Log every candidate tried", key="o_log_all")
+                go = st.form_submit_button("▶ Run optimizer", type="primary")
+
+            def _pos(txt):
+                out = []
+                for x in str(txt).replace(";", ",").split(","):
+                    x = x.strip()
+                    if x:
+                        out.append(int(float(x)))
+                return out
+
+            if go:
+                S = st.session_state
+                ov = {k: 'flange' for k in _pos(S.o_flange_at)}
+                ov.update({k: 'slip' for k in _pos(S.o_slip_at)})
+                C6 = OptConstraints(
+                    tip_min=S.o_tip_min, tip_max=S.o_tip_max, tip_inc=S.o_tip_inc,
+                    base_min=S.o_base_min, base_max=S.o_base_max, base_inc=S.o_base_inc,
+                    t_min=S.o_t_min, t_max=S.o_t_max, t_inc=S.o_t_inc,
+                    t_list=([float(x) for x in S.o_t_list.split(",") if x.strip()]
+                            if S.o_t_mode == "User list only" else None),
+                    taper_min=S.o_taper_min, taper_max=S.o_taper_max, max_wt=S.o_max_wt,
+                    bend_radius_factor=BR, fy=S.o_fy, max_segments=int(S.o_max_segments),
+                    len_preferred=S.o_len_preferred, len_normal_max=S.o_len_normal_max,
+                    len_special_max=S.o_len_special_max, min_tube=S.o_min_tube,
+                    joint_default=S.o_joint_default, joint_overrides=ov,
+                    lap_factor=S.o_lap_factor, lap_round=S.o_lap_round,
+                    slip_clearance=S.o_slip_clearance, min_slip_above_gl=S.o_min_slip_above_gl,
+                    strength_target=float(S.o_strength_target), defl_target=S.o_defl_target,
+                    tie_band_pct=S.o_tie_band_pct, n_alternates=int(S.o_n_alternates),
+                    shear_mode=SHEAR, lap_stiffness=LAP)
+                bar = st.progress(0.0, text="Starting")
+                def _prog(f, m):
+                    bar.progress(min(max(f, 0.0), 1.0), text=m)
+                opt = Optimizer(base6, spec6, C6, _prog, log_all=bool(S.o_log_all))
+                res = opt.run()
+                bar.empty()
+                st.session_state["opt_result"] = dict(res=res, C=C6, log=opt.log, file=tmp_path)
+
+            R = st.session_state.get("opt_result")
+            if R and R["file"] == tmp_path:
+                res, C6 = R["res"], R["C"]
+                w_base = _pw(spec6)['total_weight']
+                st.caption(f"{res['n_evals']} screening evaluations in {res['elapsed']:.0f} s. "
+                           f"Screening cases: {', '.join(res['screen_cases'])}. "
+                           "Every reported design was re-checked on ALL load cases, full mesh.")
+                win = res["winner"]
+                if win is None:
+                    st.error("No design satisfied all constraints and load cases. "
+                             "Widen the diameter / thickness / taper ranges and re-run.")
+                else:
+                    sw = summarize(win, C6)
+                    st.subheader("Recommended design")
+                    k = st.columns(5)
+                    k[0].metric("Shaft weight", f"{win.weight:,.0f} lb",
+                                f"{win.weight - w_base:+,.0f} lb vs baseline", delta_color="inverse")
+                    k[1].metric("Saving", f"{(1 - win.weight / w_base) * 100:.1f}%")
+                    k[2].metric("Max strength", f"{win.strength:.2f}%")
+                    k[3].metric("Max deflection", f"{win.defl:.2f}%" if win.defl is not None else "—")
+                    k[4].metric("Governs", win.gov_check)
+                    for f_, v_ in (("tip", sw["D tip (in)"]), ("base", sw["D base (in)"])):
+                        lim = (C6.tip_min, C6.tip_max) if f_ == "tip" else (C6.base_min, C6.base_max)
+                        if abs(v_ - lim[0]) < 1e-6 or abs(v_ - lim[1]) < 1e-6:
+                            st.warning(f"{f_.capitalize()} diameter {v_} in is at the edge of the search "
+                                       f"range {lim}. A lighter design may exist outside it.")
+                    lay_w = win.spec.layout()
+                    st.dataframe(pd.DataFrame([{
+                        "tube #": t['tube_no'], "length (ft)": t['length'], "thickness (in)": t['thickness'],
+                        "D top (in)": round(t['d_top'], 3), "D bot (in)": round(t['d_bot'], 3),
+                        "joint below": t['joint_type'], "lap (ft)": t['lap'],
+                        "height AGL of tube top (ft)": round(win.spec.groundline_rel - t['start'], 2),
+                    } for t in lay_w]), width="stretch", hide_index=True)
+                    st.caption(f"Taper {win.spec.taper:.5f} in/ft (derived). "
+                               f"{res.get('winner_variants', 0)} other tube-length arrangements of this "
+                               "design also pass; the one shown ranks best on section lengths.")
+
+                    st.subheader("Baseline vs recommended")
+                    st.dataframe(pd.DataFrame([
+                        {"design": "Baseline (XML)", "D tip": spec6.tip_diameter,
+                         "D base": round(spec6.base_diameter, 2), "taper": round(spec6.taper, 5),
+                         "tubes (ft)": " / ".join(f"{t['length']:g}" for t in lay6),
+                         "thickness (in)": " / ".join(f"{t['thickness']:g}" for t in lay6),
+                         "weight (lb)": round(w_base)},
+                        {"design": "Recommended", "D tip": sw["D tip (in)"], "D base": sw["D base (in)"],
+                         "taper": sw["taper (in/ft)"], "tubes (ft)": sw["tube lengths (ft)"],
+                         "thickness (in)": sw["thickness (in)"], "weight (lb)": sw["weight (lb)"]},
+                    ]), width="stretch", hide_index=True)
+
+                    st.subheader(f"Next {len(res['alternates'])} designs and why they rank lower")
+                    st.dataframe(pd.DataFrame([{
+                        "rank": i + 2, **{k_: v_ for k_, v_ in summarize(a, C6).items()
+                                          if k_ not in ("gov case",)},
+                        "Δ weight (lb)": round(a.weight - win.weight),
+                        "why not preferred": why, "length variants": nv,
+                    } for i, (a, why, nv) in enumerate(res["alternates"])]),
+                        width="stretch", hide_index=True)
+                    if res["dropped"]:
+                        st.caption(f"{len(res['dropped'])} passing designs were excluded by the section-length "
+                                   "rule (tube > normal max at a segment count where a standard layout passes).")
+
+                    st.subheader("Detail check")
+                    opts = ["Recommended"] + [f"Rank {i + 2}" for i in range(len(res["alternates"]))]
+                    pick = st.selectbox("Design", opts, key="opt_pick")
+                    e = win if pick == "Recommended" else res["alternates"][opts.index(pick) - 1][0]
+                    rr = e.result
+                    st.dataframe(pd.DataFrame([{
+                        "load case": c, "max strength %": round(x.max_strength, 2),
+                        "at ht AGL (ft)": round(x.gov_row.get('height_agl', float('nan')), 2),
+                        "tip trans (in)": round(x.defl.tip_trans_in, 2),
+                        "defl usage %": (round(x.defl_check['usage'], 2)
+                                         if x.defl_check and x.defl_check.get('usage') is not None else None),
+                    } for c, x in rr.cases.items()]), width="stretch", hide_index=True)
+                    cg = rr.cases[rr.gov_strength_case]
+                    fig7, ax7 = plt.subplots(figsize=(7, 5))
+                    for c, x in rr.cases.items():
+                        hh = [q['height_agl'] for q in x.rows]
+                        uu = [q['usage'] for q in x.rows]
+                        ax7.plot(uu, hh, linewidth=2 if c == cg.case else 0.6,
+                                 color='steelblue' if c == cg.case else 'lightgray')
+                    ax7.axvline(C6.strength_target, color='red', linestyle='--', linewidth=1)
+                    ax7.set_xlabel("Strength usage (%)"); ax7.set_ylabel("Height AGL (ft)")
+                    ax7.set_title(f"All load cases (bold = {cg.case[:35]})"); ax7.grid(True, alpha=0.3)
+                    st.pyplot(fig7); plt.close(fig7)
+
+                    st.subheader("Export")
+                    tube_csv = pd.DataFrame([{
+                        "tube": t['tube_no'], "length_ft": t['length'], "thickness_in": t['thickness'],
+                        "d_top_in": round(t['d_top'], 3), "d_bot_in": round(t['d_bot'], 3),
+                        "joint_below": t['joint_type'], "lap_ft": t['lap'], "fy_ksi": t['fy'],
+                    } for t in e.spec.layout()]).to_csv(index=False)
+                    ce = st.columns(2)
+                    ce[0].download_button("Tube table (CSV) for PLS-POLE re-verification", tube_csv,
+                                          file_name=f"{pick.replace(' ', '_')}_tubes.csv")
+                    cons = {k_: (v_ if not isinstance(v_, tuple) else list(v_))
+                            for k_, v_ in C6.__dict__.items()}
+                    ce[1].download_button("Constraint set used (JSON)", json.dumps(cons, indent=2, default=str),
+                                          file_name="constraints.json")
+                    with st.expander("Constraint set used for this run"):
+                        st.json(cons)
+                if R["log"]:
+                    with st.expander(f"Every candidate tried ({len(R['log'])})"):
+                        st.dataframe(pd.DataFrame(R["log"]), width="stretch", hide_index=True)
+        except Exception as e:
+            show_error(e)
