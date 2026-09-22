@@ -666,14 +666,14 @@ with tab6:
                 base_min=half(max(spec6.base_diameter - 15, 20)), base_max=half(spec6.base_diameter + 10),
                 base_inc=0.5, t_mode="Min / max / increment", t_min=0.1875, t_max=1.0, t_inc=0.0625,
                 t_list="0.1875, 0.25, 0.3125, 0.375, 0.4375, 0.5", taper_min=0.15, taper_max=0.50,
-                max_wt=35.0, max_segments=6, len_preferred=53.0, len_normal_max=57.0,
+                max_wt=38.0, max_segments=6, len_preferred=53.0, len_normal_max=57.0,
                 len_special_max=60.0, min_tube=15.0,
                 fix_bottom=False, bottom_length=40.0, bottom_mode="exactly L", joint_default="slip",
                 flange_at=base_flange, slip_at="", lap_factor=1.65, lap_round=0.25,
-                slip_clearance=0.125, min_slip_above_gl=10.0, fy=65.0,
+                slip_clearance=0.125, min_slip_above_gl=0.0, fy=65.0,
                 strength_target=100.0, defl_target=100.0, tolerance_pct=0.0,
                 long_tube_threshold_pct=2.0, tie_band_pct=1.0,
-                n_alternates=10, log_all=False, time_limit_min=15.0)
+                n_alternates=10, log_all=False, time_limit_min=15.0, max_evals=200000)
             for k, v in DEF.items():
                 st.session_state.setdefault(f"o_{k}", v)
             if st.button("↺ Reset all constraints to defaults"):
@@ -750,7 +750,8 @@ with tab6:
                                   help="1.65 = 1.1 × 1.5")
                 r[1].number_input("Lap rounding up to (ft)", key="o_lap_round", step=0.25)
                 r[2].number_input("Slip clearance (in)", key="o_slip_clearance", step=0.0625, format="%.4f")
-                r[3].number_input("Lowest slip joint above GL (ft)", key="o_min_slip_above_gl", step=1.0)
+                r[3].number_input("Lowest slip joint above GL (ft)", key="o_min_slip_above_gl", step=1.0,
+                                  help="Clearance from the ground line up to the BOTTOM OF THE LAP of the lowest slip joint (the female tube's lower end), not the joint itself. Default 0 = no requirement. Example (011): joint at 15.0 ft AGL, lap bottom at 7.5 ft AGL.")
 
                 st.markdown("**Acceptance and ranking**")
                 r = st.columns(4)
@@ -770,7 +771,10 @@ with tab6:
                 r[1].number_input("Search time limit (min)", key="o_time_limit_min", min_value=1.0, step=1.0,
                                   help="The search stops here and the result is flagged as truncated. "
                                        "Final all-case verification is never cut short.")
-                r[2].checkbox("Log every candidate tried", key="o_log_all")
+                r[2].number_input("Evaluation cap", key="o_max_evals", min_value=500, step=1000,
+                                  help="Hard stop on the number of screening analyses. Leave high and let "
+                                       "the time limit govern; lower it only to force a quick run.")
+                st.checkbox("Log every candidate tried", key="o_log_all")
                 go_run = st.form_submit_button("▶ Run optimizer", type="primary")
 
             def _pos(txt):
@@ -805,7 +809,8 @@ with tab6:
                     long_tube_threshold_pct=float(S.o_long_tube_threshold_pct),
                     tie_band_pct=S.o_tie_band_pct, n_alternates=int(S.o_n_alternates),
                     shear_mode=SHEAR, lap_stiffness=LAP,
-                    time_limit_s=float(S.o_time_limit_min) * 60.0)
+                    time_limit_s=float(S.o_time_limit_min) * 60.0,
+                    max_evaluations=int(S.o_max_evals))
 
                 run_hdr = st.empty()
                 run_hdr.subheader("Running")
@@ -847,10 +852,21 @@ with tab6:
                 res, C6 = R["res"], R["C"]
                 B = res["baseline"]
                 if res.get("truncated"):
-                    st.warning("⚠️ Search stopped at the time / evaluation limit before all candidate "
+                    st.warning(f"⚠️ Search stopped early — {res.get('trunc_reason') or 'limit reached'} — before all candidate "
                                "combinations were examined. The designs below passed full verification, "
-                               "but a lighter design may exist. Increase the time limit or narrow the "
-                               "diameter ranges and re-run.")
+                               "but a lighter design may exist. Raise the limit, or narrow the diameter "
+                               "ranges around the best result and re-run.")
+                    if res.get("lb_remaining") and res.get("winner"):
+                        lbw, ww = res["lb_remaining"], res["winner"].weight
+                        if lbw < ww:
+                            st.info(f"Bound on what was missed: combinations are searched in lower-bound "
+                                    f"order, so no unexamined design can weigh less than **{lbw:,.0f} lb**. "
+                                    f"The recommended design is {ww:,.0f} lb, so an unexamined design could "
+                                    f"at best be {(1 - lbw / ww) * 100:.1f}% lighter.")
+                        else:
+                            st.info(f"No unexamined combination can weigh less than {lbw:,.0f} lb, which is "
+                                    f"heavier than the recommended {ww:,.0f} lb — the result is optimal for "
+                                    "these constraints despite the early stop.")
                 else:
                     st.success(f"Search completed in {res['elapsed']:.0f} s ({res['n_evals']:,} screening "
                                "evaluations): every combination in the ranges was sized or ruled out.")

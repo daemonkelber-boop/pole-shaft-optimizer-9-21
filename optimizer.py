@@ -55,7 +55,7 @@ _trapz = getattr(np, 'trapezoid', None) or getattr(np, 'trapz')
 
 from geometry import (PoleSpec, Segment, w_over_t, GAUGES, SLIP_CLEARANCE_IN)
 from weight import pole_weight
-from loads import Baseline
+from loads import Baseline, build_load_model, first_order_forces
 from strength import evaluate_candidate, CandidateResult
 
 
@@ -80,7 +80,7 @@ class OptConstraints:
     # taper / local buckling
     taper_min: float = 0.15
     taper_max: float = 0.50
-    max_wt: float = 35.0
+    max_wt: float = 38.0
     bend_radius_factor: float = 4.5
     fy: float = 65.0
     # section lengths (ft)
@@ -103,12 +103,15 @@ class OptConstraints:
     lap_factor: float = 1.65                  # 1.1 x 1.5
     lap_round: float = 0.25
     slip_clearance: float = SLIP_CLEARANCE_IN
-    min_slip_above_gl: float = 10.0
+    min_slip_above_gl: float = 0.0
     # acceptance
     strength_target: float = 100.0
     defl_target: float = 100.0                # % of each case's XML limit
     # ranking / output
     tie_band_pct: float = 1.0
+    #: search margin: a combination whose optimistic lower-bound weight is
+    #: more than this % above the best design found is skipped.
+    explore_margin_pct: float = 3.0
     #: acceptance tolerance, RELATIVE % of the target (0-1). Applies to
     #: strength and deflection: accept if usage <= target x (1 + tol/100).
     tolerance_pct: float = 0.0
@@ -124,7 +127,7 @@ class OptConstraints:
     coarse_diam_factor: int = 2               # coarse grid = factor x increment
     coarse_len_values: Tuple[float, ...] = (53.0, 55.0, 57.0, 58.5, 60.0)
     refine_top: int = 6
-    max_evaluations: int = 8000
+    max_evaluations: int = 200000          # effectively off; time_limit_s governs
     time_limit_s: float = 900.0               # wall-clock cap for the search phases
 
     def strength_limit(self) -> float:
@@ -278,6 +281,7 @@ class Optimizer:
         self.log_all = log_all
         self.log: List[dict] = []
         self.cache: Dict[tuple, Optional[Evaluated]] = {}
+        self._env_cache: Dict[tuple, tuple] = {}
         self.n_evals = 0
         self.found: Dict[tuple, Evaluated] = {}
         self.t0 = time.time()
@@ -312,6 +316,8 @@ class Optimizer:
                 self.defl_cases.append((x.defl.s.copy(), np.abs(x.defl.Mx).copy(),
                                         np.abs(x.defl.My).copy(), allow))
         self.truncated = False
+        self.trunc_reason = ''
+        self.lb_remaining = float('inf')
         self.baseline_spec = baseline_spec
 
     # ---------------- helpers ----------------
@@ -348,6 +354,42 @@ class Optimizer:
                         if possible(u, C.len_special_max)]
         return out
 
+    def _cand_env(self, spec, ss, case_s=None, case_M=None):
+        """First-order moment envelope of THIS candidate at stations ss.
+
+        Point (wire / arm) loads are geometry independent; only the shaft
+        wind changes with diameter. First-order moments are always smaller
+        than the second-order ones the real check uses, so this keeps the
+        bound optimistic (a true lower bound on the steel required)."""
+        key = (id(spec), None if case_s is None else len(case_s))
+        cache = self._env_cache.get(key)
+        if cache is None:
+            cases = [self.screen_cases[0]] if case_s is not None else self.screen_cases
+            grid = np.linspace(0, spec.groundline_rel, 60)
+            env = np.zeros_like(grid)
+            for c in cases:
+                m = build_load_model(spec, self.base, c, ds=2.0)
+                vals = []
+                for s0 in grid:
+                    f = first_order_forces(m, s0)
+                    vals.append(math.hypot(f['Mx'], f['My']))
+                env = np.maximum(env, np.array(vals))
+            cache = (grid, env)
+            if len(self._env_cache) > 64:
+                self._env_cache.clear()
+            self._env_cache[key] = cache
+        grid, env = cache
+        out = np.interp(ss, grid, env)
+        if case_s is not None:
+            # scale the candidate envelope to this deflection case
+            ref = np.interp(ss, grid, env)
+            cas = np.interp(ss, case_s, case_M)
+            base_ref = np.interp(ss, self.env_s, self.env_M)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                ratio = np.where(base_ref > 1e-9, cas / base_ref, 0.0)
+            out = ref * np.clip(ratio, 0.0, 1.0)
+        return out
+
     def _lower_bound(self, d: Design) -> Tuple[Optional[float], Tuple[int, ...]]:
         """Relaxed (continuous-thickness) minimum weight and a starting gauge
         set, from three necessary conditions:
@@ -375,7 +417,7 @@ class Optimizer:
             ss = np.linspace(lo, hi, 12)
             D = tb['d_top'] + spec.taper * (ss - tb['start'])
             above = ss <= gl
-            M = 0.85 * np.interp(ss, self.env_s, self.env_M)
+            M = self._cand_env(spec, ss)
             need = float(np.max(np.where(above, 6.0 * M / (0.411 * D * D * C.fy), 0.0)))
             need = max(need, 0.268 * tb['d_bot'] /
                        (C.max_wt + 0.268 * (1 + 2 * C.bend_radius_factor)), G[0])
@@ -396,7 +438,7 @@ class Optimizer:
         for (s_, Mx_, My_, allow) in self.defl_cases:
             A = []
             for (ss, D, above, h) in samples:
-                M = 0.9 * np.hypot(np.interp(ss, s_, Mx_), np.interp(ss, s_, My_))
+                M = self._cand_env(spec, ss, case_s=s_, case_M=np.hypot(Mx_, My_))
                 kap = np.where(above, M * ss * 144.0 / (E * 0.411 * D ** 3), 0.0)
                 A.append(float(_trapz(kap, dx=h)))
             A = np.array(A)
@@ -532,8 +574,13 @@ class Optimizer:
         return e
 
     def _over_budget(self) -> bool:
-        return (self.n_evals >= self.C.max_evaluations or
-                time.time() - self.t0 >= self.C.time_limit_s)
+        if self.n_evals >= self.C.max_evaluations:
+            self.trunc_reason = f"evaluation cap ({self.C.max_evaluations:,}) reached"
+            return True
+        if time.time() - self.t0 >= self.C.time_limit_s:
+            self.trunc_reason = f"time limit ({self.C.time_limit_s / 60:.0f} min) reached"
+            return True
+        return False
 
     def _record(self, e: Optional[Evaluated]):
         if e is None:
@@ -554,8 +601,16 @@ class Optimizer:
         for i, (lb, d) in enumerate(combos):
             if self._over_budget():
                 self.truncated = True
+                self.lb_remaining = min(self.lb_remaining, lb)
                 break
-            if lb > self._kth_weight(K) * (1 + 3 * self.C.tie_band_pct / 100):
+            # Prune against the BEST weight found so far plus a margin, not
+            # the Kth best: a combination whose optimistic lower bound is
+            # already heavier than that cannot win, and alternates come from
+            # designs that were evaluated anyway.
+            best = min((x.weight for x in self.found.values()), default=float('inf'))
+            margin = 1 + max(self.C.tie_band_pct, self.C.explore_margin_pct) / 100.0
+            if lb > min(best * margin, self._kth_weight(K)):
+                self.lb_remaining = min(self.lb_remaining, lb)
                 break
             self.phase = label
             self.progress(f0 + (f1 - f0) * i / max(n, 1),
@@ -725,7 +780,8 @@ class Optimizer:
                                "best long-tube (lb)": round(w_lng) if w_lng else None,
                                "long-tube saving %": round(sav, 2) if sav is not None else None,
                                "decision": dec})
-        common = dict(truncated=self.truncated, n_evals=self.n_evals,
+        common = dict(truncated=self.truncated, trunc_reason=self.trunc_reason,
+                      lb_remaining=(None if self.lb_remaining == float('inf') else self.lb_remaining), n_evals=self.n_evals,
                       elapsed=time.time() - self.t0, screen_cases=self.screen_cases,
                       history=list(self.history), long_table=long_table,
                       baseline=self.baseline_info(), dropped=dropped)
