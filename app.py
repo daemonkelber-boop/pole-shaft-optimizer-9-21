@@ -667,7 +667,8 @@ with tab6:
                 base_inc=0.5, t_mode="Min / max / increment", t_min=0.1875, t_max=1.0, t_inc=0.0625,
                 t_list="0.1875, 0.25, 0.3125, 0.375, 0.4375, 0.5", taper_min=0.15, taper_max=0.50,
                 max_wt=35.0, max_segments=6, len_preferred=53.0, len_normal_max=57.0,
-                len_special_max=60.0, min_tube=15.0, joint_default="slip",
+                len_special_max=60.0, min_tube=15.0,
+                fix_bottom=False, bottom_length=40.0, bottom_mode="exactly L", joint_default="slip",
                 flange_at=base_flange, slip_at="", lap_factor=1.65, lap_round=0.25,
                 slip_clearance=0.125, min_slip_above_gl=10.0, fy=65.0,
                 strength_target=100.0, defl_target=100.0, tolerance_pct=0.0,
@@ -712,6 +713,21 @@ with tab6:
                 r[2].number_input("Normal max length (ft)", key="o_len_normal_max", step=0.25)
                 r[3].number_input("Long-tube max length (ft)", key="o_len_special_max", step=0.25)
                 r[4].number_input("Min tube length (ft)", key="o_min_tube", step=0.25)
+                r2 = st.columns([1, 1, 1.4])
+                r2[0].checkbox("Fix bottom tube length", key="o_fix_bottom")
+                r2[1].number_input("Bottom tube length L (ft)", key="o_bottom_length", step=0.25,
+                                   min_value=1.0)
+                r2[2].radio("L means", ["exactly L", "at most L"], key="o_bottom_mode", horizontal=True)
+                st.caption(
+                    "**Fixed bottom tube (off by default).** Some customers require the base section at a "
+                    "set length. L is the **fabricated length of the bottom tube, embedment included** - "
+                    "on a pole with 20 ft embedment, L = 40 ft means 40 ft of steel with 20 ft above ground. "
+                    "The tube directly above then absorbs the remaining height on the 0.25 ft grid and is "
+                    "not held to the preferred 53 / 57 ft lengths. If that tube would fall outside the min / "
+                    "max tube length, the segment count is infeasible and the optimizer moves to the next "
+                    "one automatically. *Example (003, 110 ft, base plate): L = 40 ft has no 2-segment "
+                    "solution, so the result is 3 segments, 53 / 27 / 40 ft at 13,379 lb versus 12,798 lb "
+                    "unconstrained.*")
                 st.number_input("Long-tube weight threshold X (%)", key="o_long_tube_threshold_pct",
                                 min_value=0.0, step=0.5)
                 st.caption(
@@ -779,6 +795,8 @@ with tab6:
                     bend_radius_factor=BR, fy=S.o_fy, max_segments=int(S.o_max_segments),
                     len_preferred=S.o_len_preferred, len_normal_max=S.o_len_normal_max,
                     len_special_max=S.o_len_special_max, min_tube=S.o_min_tube,
+                    fix_bottom=bool(S.o_fix_bottom), bottom_length=float(S.o_bottom_length),
+                    bottom_mode=('exact' if S.o_bottom_mode == 'exactly L' else 'max'),
                     joint_default=S.o_joint_default, joint_overrides=ov,
                     lap_factor=S.o_lap_factor, lap_round=S.o_lap_round,
                     slip_clearance=S.o_slip_clearance, min_slip_above_gl=S.o_min_slip_above_gl,
