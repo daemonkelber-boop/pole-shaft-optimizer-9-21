@@ -137,6 +137,13 @@ class DeflectionResult:
                     Vx=f(self.Vx), Vy=f(self.Vy), T=f(self.T))
 
 
+def lap_zone(spec, s):
+    for tb in spec.layout():
+        if tb['lap_top'] is not None and tb['lap_top'] - 1e-9 <= s <= tb['lap_bottom'] + 1e-9:
+            return tb['lap_top'], tb['lap_bottom']
+    return s, s
+
+
 def _stiffness(spec, s_nodes, E_ksi, lap_stiffness):
     """EI (kip-ft^2) and EA (kips) at each node."""
     EI = np.zeros(len(s_nodes))
@@ -148,6 +155,13 @@ def _stiffness(spec, s_nodes, E_ksi, lap_stiffness):
                 use = tb
             elif lap_stiffness == 'inner':
                 use = [min(tb, key=lambda d: d[0])]
+            elif lap_stiffness == 'stiffer':
+                use = [max(tb, key=lambda d: d[0] ** 3 * d[1])]
+            elif lap_stiffness == 'midpoint':
+                # female above the lap mid-point, male below it
+                lo, hi = lap_zone(spec, s)
+                use = [max(tb, key=lambda d: d[0])] if s < 0.5 * (lo + hi) else \
+                      [min(tb, key=lambda d: d[0])]
             else:
                 use = [max(tb, key=lambda d: d[0])]
         else:
@@ -161,7 +175,7 @@ def _stiffness(spec, s_nodes, E_ksi, lap_stiffness):
 
 def solve_deflection(model: LoadModel, ds: float = 0.25,
                      E_ksi: float = E_STEEL_KSI,
-                     lap_stiffness: str = 'outer',
+                     lap_stiffness: str = 'midpoint',
                      max_iter: int = 50, tol_in: float = 0.001,
                      second_order: bool = True) -> DeflectionResult:
     spec = model.spec
