@@ -110,7 +110,7 @@ def evaluate_candidate(spec: PoleSpec, base: Baseline,
                        cases: Optional[List[str]] = None,
                        bend_radius_factor: float = BEND_RADIUS_FACTOR,
                        shear_mode: str = 'resultant',
-                       lap_stiffness: str = 'outer',
+                       lap_stiffness: str = 'midpoint',
                        spacing: float = 1.0, ds: float = 0.25,
                        keep_rows: bool = True) -> CandidateResult:
     cases = cases or list(base.load_cases.keys())
