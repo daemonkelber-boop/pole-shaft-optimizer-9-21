@@ -51,6 +51,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
+_trapz = getattr(np, 'trapezoid', None) or getattr(np, 'trapz')
+
 from geometry import (PoleSpec, Segment, w_over_t, GAUGES, SLIP_CLEARANCE_IN)
 from weight import pole_weight
 from loads import Baseline
@@ -100,15 +102,29 @@ class OptConstraints:
     defl_target: float = 100.0                # % of each case's XML limit
     # ranking / output
     tie_band_pct: float = 1.0
+    #: acceptance tolerance, RELATIVE % of the target (0-1). Applies to
+    #: strength and deflection: accept if usage <= target x (1 + tol/100).
+    tolerance_pct: float = 0.0
+    #: long-tube threshold X (%): a design with a tube longer than
+    #: len_normal_max is accepted only if it is more than X% lighter than the
+    #: best all-standard design with the same number of segments.
+    long_tube_threshold_pct: float = 2.0
     n_alternates: int = 10
     # analysis options
     shear_mode: str = 'resultant'
-    lap_stiffness: str = 'outer'
+    lap_stiffness: str = 'midpoint'
     # search effort
     coarse_diam_factor: int = 2               # coarse grid = factor x increment
     coarse_len_values: Tuple[float, ...] = (53.0, 55.0, 57.0, 58.5, 60.0)
     refine_top: int = 6
-    max_evaluations: int = 4000
+    max_evaluations: int = 8000
+    time_limit_s: float = 900.0               # wall-clock cap for the search phases
+
+    def strength_limit(self) -> float:
+        return self.strength_target * (1.0 + self.tolerance_pct / 100.0)
+
+    def defl_limit(self) -> float:
+        return self.defl_target * (1.0 + self.tolerance_pct / 100.0)
 
     def gauges(self) -> List[float]:
         if self.t_list:
@@ -221,6 +237,9 @@ class Optimizer:
         self.n_evals = 0
         self.found: Dict[tuple, Evaluated] = {}
         self.t0 = time.time()
+        self.history: List[Tuple[int, float, float]] = []   # (evals, seconds, best screened lb)
+        self.best_weight = float('inf')
+        self.phase = 'Baseline analysis'
 
         # baseline run: screening cases + moment envelope for the bound
         self.progress(0.0, "Analysing baseline design (all load cases)")
@@ -240,52 +259,109 @@ class Optimizer:
             M = np.hypot(x.defl.Mx, x.defl.My)
             env = np.maximum(env, np.interp(env_s, x.defl.s, M))
         self.env_s, self.env_M = env_s, env
+        # deflection-limited cases: moment diagrams + allowable tip deflection
+        self.defl_cases = []
+        for x in b.cases.values():
+            dc = x.defl_check
+            if dc and dc.get('allowable_ft'):
+                allow = dc['allowable_ft'] * C.defl_target / 100.0
+                self.defl_cases.append((x.defl.s.copy(), np.abs(x.defl.Mx).copy(),
+                                        np.abs(x.defl.My).copy(), allow))
+        self.truncated = False
+        self.baseline_spec = baseline_spec
 
     # ---------------- helpers ----------------
     def _layouts(self, values) -> List[Tuple[float, ...]]:
+        """Upper-tube length sets. Tubes longer than the normal max are only
+        generated at a segment count where no all-standard layout is
+        geometrically possible (the section-length rule), because they would
+        be discarded at ranking anyway."""
         C, H = self.C, self.H
         out = []
         for n in range(1, C.max_segments + 1):
-            for up in itertools.product(values, repeat=n - 1):
-                # crude lap envelope: 0-12 ft per joint
-                lo = H - sum(up)
-                if lo + 12.0 * (n - 1) < C.min_tube or lo > C.len_special_max:
-                    continue
-                out.append(tuple(up))
+            nj = sum(1 for k in range(1, n) if C.joint_type(k) == 'slip')
+            lap_hi = 12.0 * nj
+            def possible(up, bottom_max):
+                lo = H - sum(up)                      # bottom length before laps
+                return lo + lap_hi >= C.min_tube and lo <= bottom_max
+            std = [u for u in itertools.product(
+                       [v for v in values if v <= C.len_normal_max + 1e-9], repeat=n - 1)
+                   if possible(u, C.len_normal_max)]
+            if std:
+                out += [tuple(u) for u in std]
+            else:
+                out += [tuple(u) for u in itertools.product(values, repeat=n - 1)
+                        if possible(u, C.len_special_max)]
         return out
 
     def _lower_bound(self, d: Design) -> Tuple[Optional[float], Tuple[int, ...]]:
-        """Cheap lower-bound thickness per tube and the resulting weight."""
+        """Relaxed (continuous-thickness) minimum weight and a starting gauge
+        set, from three necessary conditions:
+          * w/t <= max at each tube bottom
+          * strength: M/S <= Fy using 85% of the baseline moment envelope
+          * stiffness: first-order tip deflection <= allowable for every
+            deflection-limited case, using 90% of the baseline moments,
+            minimum-weight thickness distribution by Lagrange multiplier.
+        Every condition is a relaxation, so the bound is optimistic -- it
+        orders the search; it never accepts a design."""
         C, G = self.C, self.G
         spec, why = make_spec(Design(d.tip, d.base, d.uppers, tuple([len(G) - 1] * d.n)),
                               self.H, self.emb, C, G)
         if spec is None and not why.startswith('tube'):
-            # geometric failure independent of thickness -> try thinnest
             spec, why = make_spec(Design(d.tip, d.base, d.uppers, tuple([0] * d.n)),
                                   self.H, self.emb, C, G)
             if spec is None:
                 return None, ()
         lay = spec.layout()
-        idx = []
+        gl = spec.groundline_rel
+        E = 29000.0
+        t_str, c_w, samples = [], [], []
         for tb in lay:
-            lo, hi = tb['start'], min(tb['end'], spec.groundline_rel)
-            need = 0.0
-            for s in np.linspace(lo, hi, 6):
-                D = tb['d_top'] + spec.taper * (s - tb['start'])
-                M = 0.85 * float(np.interp(s, self.env_s, self.env_M))
-                need = max(need, 6.0 * M / (0.411 * D * D * C.fy))
-            # w/t: w = 0.268 (D - t - 2 BR t) -> t >= 0.268 D / (max_wt + 0.268(1+2BR))
+            lo, hi = tb['start'], tb['end']
+            ss = np.linspace(lo, hi, 12)
+            D = tb['d_top'] + spec.taper * (ss - tb['start'])
+            above = ss <= gl
+            M = 0.85 * np.interp(ss, self.env_s, self.env_M)
+            need = float(np.max(np.where(above, 6.0 * M / (0.411 * D * D * C.fy), 0.0)))
             need = max(need, 0.268 * tb['d_bot'] /
-                       (C.max_wt + 0.268 * (1 + 2 * C.bend_radius_factor)))
+                       (C.max_wt + 0.268 * (1 + 2 * C.bend_radius_factor)), G[0])
+            t_str.append(need)
+            h = (hi - lo) / (len(ss) - 1)
+            # lb of steel per inch of wall: 3.22 D * 12 in/ft / 1728 * 490 pcf
+            c_w.append(float(_trapz(3.22 * D * 12.0 / 1728.0 * 490.0, dx=h)))
+            samples.append((ss, D, above, h))
+        # per-tube necessary conditions -> next gauge up is still a valid bound
+        snap = []
+        for need in t_str:
             k = next((i for i, g in enumerate(G) if g >= need - 1e-9), None)
             if k is None:
                 return None, ()
-            idx.append(k)
-        spec2, _ = make_spec(Design(d.tip, d.base, d.uppers, tuple(idx)),
-                             self.H, self.emb, C, G)
-        if spec2 is None:
-            return None, tuple(idx)
-        return pole_weight(spec2, n_steps=20)['total_weight'], tuple(idx)
+            snap.append(G[k])
+        t_str = snap
+        t = np.array(t_str)
+        for (s_, Mx_, My_, allow) in self.defl_cases:
+            A = []
+            for (ss, D, above, h) in samples:
+                M = 0.9 * np.hypot(np.interp(ss, s_, Mx_), np.interp(ss, s_, My_))
+                kap = np.where(above, M * ss * 144.0 / (E * 0.411 * D ** 3), 0.0)
+                A.append(float(_trapz(kap, dx=h)))
+            A = np.array(A)
+            if np.sum(A / t) <= allow:
+                continue
+            cw = np.array(c_w)
+            lo_l, hi_l = 1e-12, 1e12
+            for _ in range(80):                       # bisection on multiplier
+                lam = math.sqrt(lo_l * hi_l)
+                tk = np.maximum(t, np.sqrt(A / (lam * cw)))
+                if np.sum(A / tk) > allow:
+                    hi_l = lam          # walls too thin -> smaller multiplier
+                else:
+                    lo_l = lam
+            t = np.maximum(t, np.sqrt(A / (lo_l * cw)))   # feasible side
+        if t.max() > G[-1] + 1e-9:
+            return None, ()
+        idx = tuple(next(i for i, g in enumerate(G) if g >= tk - 1e-9) for tk in t)
+        return float(np.dot(c_w, t)), idx
 
     def _eval(self, d: Design, full: bool = False) -> Tuple[Optional[Evaluated], str]:
         key = (d.tip, d.base, d.uppers, d.ts, full)
@@ -312,7 +388,7 @@ class Optimizer:
         e = Evaluated(d, spec, w, r.max_strength, dmax,
                       r.gov_defl_case if gov_check == 'deflection' else r.gov_strength_case,
                       gov_check, verified=full, result=r if full else None)
-        ok = r.max_strength <= C.strength_target + 1e-9 and (dmax or 0) <= C.defl_target + 1e-9
+        ok = r.max_strength <= C.strength_limit() + 1e-9 and (dmax or 0) <= C.defl_limit() + 1e-9
         self.cache[key] = e if ok else None
         self._log(d, e, 'pass' if ok else 'fail', r)
         if not ok:
@@ -321,7 +397,7 @@ class Optimizer:
 
     def _fail_reason(self, r: CandidateResult) -> str:
         C = self.C
-        if r.max_strength > C.strength_target:
+        if r.max_strength > C.strength_limit():
             g = r.cases[r.gov_strength_case].gov_row
             return f"strength:{g.get('tube_no', 1)}"
         return "deflection"
@@ -355,14 +431,18 @@ class Optimizer:
                 best, bi = gain / cost, k
         return bi
 
-    def size(self, d: Design, full: bool = False, max_up: int = 40) -> Optional[Evaluated]:
+    def size(self, d: Design, full: bool = False, max_up: int = 40,
+             budget: bool = True) -> Optional[Evaluated]:
         """Thicken until passing, then thin each tube as far as possible."""
         G = self.G
         ts = list(d.ts)
         e, why = self._eval(Design(d.tip, d.base, d.uppers, tuple(ts)), full)
         ups = 0
         while e is None:
-            if ups >= max_up or self.n_evals >= self.C.max_evaluations:
+            if budget and self._over_budget():
+                self.truncated = True
+                return None
+            if ups >= max_up:
                 return None
             if why.startswith('strength'):
                 k = int(why.split(':')[1]) - 1
@@ -397,11 +477,18 @@ class Optimizer:
         e, _ = self._eval(Design(d.tip, d.base, d.uppers, tuple(ts)), full)
         return e
 
+    def _over_budget(self) -> bool:
+        return (self.n_evals >= self.C.max_evaluations or
+                time.time() - self.t0 >= self.C.time_limit_s)
+
     def _record(self, e: Optional[Evaluated]):
         if e is None:
             return
         key = (e.design.tip, e.design.base, e.design.uppers, e.design.ts)
         self.found[key] = e
+        if e.weight < self.best_weight - 1e-6:
+            self.best_weight = e.weight
+            self.history.append((self.n_evals, time.time() - self.t0, e.weight))
 
     def _kth_weight(self, k: int) -> float:
         ws = sorted(x.weight for x in self.found.values())
@@ -411,10 +498,12 @@ class Optimizer:
         K = self.C.n_alternates + 1
         n = len(combos)
         for i, (lb, d) in enumerate(combos):
-            if self.n_evals >= self.C.max_evaluations:
+            if self._over_budget():
+                self.truncated = True
                 break
             if lb > self._kth_weight(K) * (1 + 3 * self.C.tie_band_pct / 100):
                 break
+            self.phase = label
             self.progress(f0 + (f1 - f0) * i / max(n, 1),
                           f"{label}: {i + 1}/{n}  D {d.tip}/{d.base}  tubes "
                           f"{'/'.join(f'{x:g}' for x in d.uppers) or '-'}  "
@@ -451,6 +540,34 @@ class Optimizer:
         bases = grid(C.base_min, C.base_max, cinc_b)
         lay_c = self._layouts([v for v in C.coarse_len_values
                                if C.len_preferred - 1e-9 <= v <= C.len_special_max + 1e-9])
+
+        # Seed: the baseline geometry itself (if it fits the constraint set),
+        # so the result can never be heavier than the baseline.
+        self.baseline_seed = None
+        self.seed_note = ''
+        bs = self.baseline_spec
+        try:
+            ups = tuple(sg.length for sg in bs.segments[:-1])
+            idx = tuple(next(i for i, g in enumerate(self.G) if abs(g - sg.thickness) < 1e-6)
+                        for sg in bs.segments)
+            snap = lambda v, inc: (round(round(v / inc) * inc, 3)
+                                   if abs(v / inc - round(v / inc)) * inc < 0.01 else round(v, 3))
+            seed = Design(snap(bs.tip_diameter, C.tip_inc), snap(bs.base_diameter, C.base_inc), ups, idx)
+            self.phase = 'Sizing baseline (seed)'
+            self.progress(0.01, "Sizing the baseline geometry (seed)")
+            e = self.size(seed)
+            self._record(e)
+            self.baseline_seed = e
+            if e is None:
+                self.seed_note = "baseline geometry could not be made to pass within the constraint set"
+            elif e.design.ts != idx:
+                chg = ", ".join(f"tube {k + 1} {self.G[a]:g} -> {self.G[b]:g} in"
+                                for k, (a, b) in enumerate(zip(idx, e.design.ts)) if a != b)
+                self.seed_note = f"re-sized to the acceptance limits: {chg}"
+            else:
+                self.seed_note = "passes as-is (same thicknesses)"
+        except StopIteration:
+            self.seed_note = "baseline thickness not in the thickness list -- not seeded"
 
         self.progress(0.02, "Building coarse candidate list")
         combos = self._combos(tips, bases, lay_c)
@@ -492,11 +609,24 @@ class Optimizer:
                                               length_class(x.spec, C)['deviation'], x.weight))
             pick = [vs[0]] + [p for p in pref[:2] if p is not vs[0]]
             pool.extend(pick)
+        # the long-tube rule compares the best standard and the best long-tube
+        # design at each segment count -> both must always be verified
+        ids = {id(x) for x in pool}
+        by_n: Dict[int, Dict[bool, List[Evaluated]]] = {}
+        for x in self.found.values():
+            lng = length_class(x.spec, C)['n_special'] > 0
+            by_n.setdefault(x.design.n, {}).setdefault(lng, []).append(x)
+        for nn, d_ in by_n.items():
+            for lng, xs in d_.items():
+                for x in sorted(xs, key=lambda q: q.weight)[:2]:
+                    if id(x) not in ids:
+                        pool.append(x); ids.add(id(x))
         verified: Dict[tuple, Evaluated] = {}
+        self.phase = 'Verifying on all load cases'
         for i, e in enumerate(pool):
             self.progress(0.8 + 0.18 * i / max(len(pool), 1),
                           f"Verifying on all load cases: {i + 1}/{len(pool)}")
-            v = self.size(e.design, full=True)
+            v = self.size(e.design, full=True, budget=False)
             if v is not None:
                 k = (v.design.tip, v.design.base, v.design.uppers, v.design.ts)
                 verified[k] = v
@@ -507,21 +637,44 @@ class Optimizer:
     def _rank(self, cands: List[Evaluated]) -> dict:
         C = self.C
         info = {}
-        # section-length rule: >normal_max tube only if it saves a segment
+        # Long-tube rule (threshold X): at each segment count a design with a
+        # tube > len_normal_max is kept only if it is more than X% lighter
+        # than the best all-standard design with the same segment count.
         by_n: Dict[int, List[Evaluated]] = {}
         for e in cands:
             by_n.setdefault(e.design.n, []).append(e)
-        kept, dropped = [], []
-        for n, es in by_n.items():
-            has_std = any(length_class(e.spec, C)['n_special'] == 0 for e in es)
-            for e in es:
-                if has_std and length_class(e.spec, C)['n_special'] > 0:
-                    dropped.append(e)
-                else:
+        kept, dropped, long_table = [], [], []
+        X = C.long_tube_threshold_pct
+        for n, es in sorted(by_n.items()):
+            std = [e for e in es if length_class(e.spec, C)['n_special'] == 0]
+            lng = [e for e in es if length_class(e.spec, C)['n_special'] > 0]
+            w_std = min((e.weight for e in std), default=None)
+            w_lng = min((e.weight for e in lng), default=None)
+            kept += std
+            for e in lng:
+                if w_std is None or e.weight <= w_std * (1 - X / 100.0) + 1e-9:
                     kept.append(e)
+                else:
+                    dropped.append(e)
+            if w_std is not None and w_lng is not None:
+                sav = (1 - w_lng / w_std) * 100
+                dec = (f"long-tube designs used (saving {sav:.1f}% > X = {X:g}%)" if sav > X
+                       else f"standard lengths kept (saving {sav:.1f}% <= X = {X:g}%)")
+            elif w_lng is not None:
+                sav, dec = None, "no standard-length design possible -> long tubes allowed"
+            else:
+                sav, dec = None, "standard lengths only"
+            long_table.append({"segments": n,
+                               "best standard (lb)": round(w_std) if w_std else None,
+                               "best long-tube (lb)": round(w_lng) if w_lng else None,
+                               "long-tube saving %": round(sav, 2) if sav is not None else None,
+                               "decision": dec})
+        common = dict(truncated=self.truncated, n_evals=self.n_evals,
+                      elapsed=time.time() - self.t0, screen_cases=self.screen_cases,
+                      history=list(self.history), long_table=long_table,
+                      baseline=self.baseline_info(), dropped=dropped)
         if not kept:
-            return dict(winner=None, alternates=[], dropped=dropped, n_evals=self.n_evals,
-                        elapsed=time.time() - self.t0, screen_cases=self.screen_cases)
+            return dict(winner=None, alternates=[], kept=[], **common)
         wmin = min(e.weight for e in kept)
         band = wmin * (1 + C.tie_band_pct / 100.0)
 
@@ -550,8 +703,15 @@ class Optimizer:
         alts = reps[1:1 + C.n_alternates]
         return dict(winner=win, winner_variants=variants[id(win)],
                     alternates=[(a, self.reason(a, win, band), variants[id(a)]) for a in alts],
-                    dropped=dropped, wmin=wmin, band=band, n_evals=self.n_evals,
-                    elapsed=time.time() - self.t0, screen_cases=self.screen_cases)
+                    kept=kept, wmin=wmin, band=band, **common)
+
+    def baseline_info(self) -> dict:
+        b = self.baseline_result
+        w = pole_weight(self.baseline_spec)['total_weight']
+        s = self.baseline_seed
+        return dict(weight=w, strength=b.max_strength, defl=b.max_defl_usage,
+                    gov_strength_case=b.gov_strength_case, gov_defl_case=b.gov_defl_case,
+                    seed_weight=s.weight if s else None, seed_note=self.seed_note)
 
     def reason(self, a: Evaluated, w: Evaluated, band: float) -> str:
         C = self.C
@@ -592,4 +752,7 @@ def summarize(e: Evaluated, C: OptConstraints) -> dict:
         "max strength %": round(e.strength, 2),
         "max defl %": round(e.defl, 2) if e.defl is not None else None,
         "governs": e.gov_check, "gov case": e.gov_case,
+        "acceptance": ("within tolerance" if (e.strength > C.strength_target + 1e-9 or
+                                               (e.defl or 0) > C.defl_target + 1e-9) else "at/below target"),
+        "long tube": "yes" if length_class(e.spec, C)['n_special'] else "no",
     }
