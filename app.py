@@ -26,9 +26,11 @@ with st.sidebar:
     SHEAR = st.radio("Shear for stress check", ["resultant", "transverse_only"], index=0,
                      help="Shear direction used at the perimeter points. Identical on "
                           "tangent structures with no longitudinal load.")
-    LAP = st.radio("Slip-joint lap stiffness (deflection)", ["outer", "inner", "sum"], index=0,
-                   help="outer = female tube only (default, validated on 003 to +0.3%); "
-                        "inner = male only; sum = both walls composite.")
+    LAP = st.radio("Slip-joint lap stiffness (deflection)", ["midpoint", "outer", "inner", "sum"], index=0,
+                   help="midpoint (default) = female tube above the lap mid-point, male below; "
+                        "conservative by +0.1% to +0.6% mean on tip deflection vs PLS-POLE "
+                        "(003, 014, 015). outer = female only (+0.4% to +1.9%); "
+                        "inner = male only (slightly unconservative); sum = both walls (too stiff).")
 
 # ── Cached helpers ─────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
@@ -621,7 +623,9 @@ with tab6:
         st.info("Upload a PLS-POLE XML file in the sidebar to begin.")
     else:
         try:
-            import json, math as _m
+            import json, math as _m, time as _time
+            import plotly.graph_objects as go
+            from pls_pole_xml_parser import get_single_table as _gst6, get_field as _gf6
             from optimizer import Optimizer, OptConstraints, summarize, length_class
             from weight import pole_weight as _pw
 
@@ -631,9 +635,31 @@ with tab6:
             lay6 = spec6.layout()
             n_j6 = len(lay6) - 1
             half = lambda v: _m.floor(v * 2) / 2
-            # baseline joint types by position from bottom (1 = lowest joint)
             base_joints = {n_j6 - k: lay6[k]['joint_type'] for k in range(n_j6)}
             base_flange = ",".join(str(k) for k, v in sorted(base_joints.items()) if v == 'flange')
+
+            # ---- baseline (seed) weights -------------------------------------
+            w_base = _pw(spec6)['total_weight']
+            pls_total = _gf6(_gst6(p6, 'summary_of_steel_pole_usages')[0], 'weight')
+            plate_w, plate_note = 0.0, "no base plate"
+            if 'base_plate_properties' in p6['tables']:
+                lab = _gst6(p6, 'steel_pole_properties')[0].get('steel_pole_property_label')
+                rows_bp = [r for inst in p6['tables']['base_plate_properties'] for r in inst['rows']]
+                match = [r for r in rows_bp if r.get('pole_property') == lab] or rows_bp[:1]
+                if match and str(_gst6(p6, 'steel_pole_properties')[0].get('base_plate', '')).lower() == 'yes':
+                    plate_w = _gf6(match[0], 'plate_weight') or 0.0
+                    plate_note = f"base plate {plate_w:,.0f} lb removed"
+            pls_shaft = (pls_total - plate_w) if pls_total else None
+
+            st.subheader("Starting point (baseline XML, shaft only)")
+            b_ = st.columns(3)
+            b_[0].metric("Engine shaft weight", f"{w_base:,.0f} lb",
+                         help="Steel in all tubes including laps and embedded length. Base plate excluded.")
+            b_[1].metric("PLS-POLE shaft weight", f"{pls_shaft:,.0f} lb" if pls_shaft else "—",
+                         help=f"PLS-reported pole weight {pls_total:,.1f} lb; {plate_note}." if pls_total else None)
+            b_[2].metric("Engine vs PLS", f"{(w_base / pls_shaft - 1) * 100:+.2f}%" if pls_shaft else "—")
+            st.caption(f"PLS-POLE reported {pls_total:,.1f} lb; {plate_note}. "
+                       "All savings below are measured against the engine shaft weight." if pls_total else "")
 
             DEF = dict(
                 tip_min=10.0, tip_max=half(spec6.tip_diameter + 7), tip_inc=0.5,
@@ -644,8 +670,9 @@ with tab6:
                 len_special_max=60.0, min_tube=15.0, joint_default="slip",
                 flange_at=base_flange, slip_at="", lap_factor=1.65, lap_round=0.25,
                 slip_clearance=0.125, min_slip_above_gl=10.0, fy=65.0,
-                strength_target=100.0, defl_target=100.0, tie_band_pct=1.0,
-                n_alternates=10, log_all=False)
+                strength_target=100.0, defl_target=100.0, tolerance_pct=0.0,
+                long_tube_threshold_pct=2.0, tie_band_pct=1.0,
+                n_alternates=10, log_all=False, time_limit_min=15.0)
             for k, v in DEF.items():
                 st.session_state.setdefault(f"o_{k}", v)
             if st.button("↺ Reset all constraints to defaults"):
@@ -654,7 +681,7 @@ with tab6:
                 st.rerun()
 
             with st.form("opt_form"):
-                st.markdown("**Diameters and thickness** (0.5 in grid; tip and base stay on the grid, taper is derived)")
+                st.markdown("**Diameters and thickness** (tip and base stay on the grid; taper is derived)")
                 h = st.columns([1.3, 1, 1, 1])
                 h[1].markdown("Minimum"); h[2].markdown("Maximum"); h[3].markdown("Increment")
                 r = st.columns([1.3, 1, 1, 1]); r[0].markdown("Top diameter (in)")
@@ -683,9 +710,19 @@ with tab6:
                 r[0].number_input("Max segments", key="o_max_segments", min_value=1, max_value=10, step=1)
                 r[1].number_input("Preferred length (ft)", key="o_len_preferred", step=0.25)
                 r[2].number_input("Normal max length (ft)", key="o_len_normal_max", step=0.25)
-                r[3].number_input("Special max length (ft)", key="o_len_special_max", step=0.25,
-                                  help="Lengths above the normal max are used only when they avoid an extra segment.")
+                r[3].number_input("Long-tube max length (ft)", key="o_len_special_max", step=0.25)
                 r[4].number_input("Min tube length (ft)", key="o_min_tube", step=0.25)
+                st.number_input("Long-tube weight threshold X (%)", key="o_long_tube_threshold_pct",
+                                min_value=0.0, step=0.5)
+                st.caption(
+                    "**What is X?** Tubes longer than the *normal max* (57 ft default) are harder to "
+                    "fabricate, galvanize and ship. For each segment count, the optimizer compares the "
+                    "lightest design that uses only standard lengths with the lightest design that uses a "
+                    "long tube. The long-tube design is accepted only if it is **more than X% lighter**. "
+                    "X = 0 → always take the lighter design; a large X → long tubes are effectively "
+                    "never used when a standard layout exists. *Example (003): standard 57/57 ft = 14,199 lb, "
+                    "long-tube 54/60 ft = 12,784 lb → 10.0% saving → accepted when X < 10.0.* "
+                    "If no standard-length layout is possible at a segment count, long tubes are allowed there.")
                 r = st.columns(3)
                 r[0].radio("Default joint type", ["slip", "flange"], key="o_joint_default", horizontal=True)
                 r[1].text_input("Force FLANGE at joints (1 = lowest)", key="o_flange_at",
@@ -700,13 +737,25 @@ with tab6:
                 r[3].number_input("Lowest slip joint above GL (ft)", key="o_min_slip_above_gl", step=1.0)
 
                 st.markdown("**Acceptance and ranking**")
-                r = st.columns(5)
+                r = st.columns(4)
                 r[0].selectbox("Strength usage target (%)", [100.0, 95.0, 90.0, 85.0], key="o_strength_target")
                 r[1].number_input("Deflection target (% of XML limit)", key="o_defl_target", step=5.0)
-                r[2].number_input("Tie band (% of lightest)", key="o_tie_band_pct", step=0.5)
-                r[3].number_input("Alternates to report", key="o_n_alternates", min_value=0, max_value=30, step=1)
-                r[4].checkbox("Log every candidate tried", key="o_log_all")
-                go = st.form_submit_button("▶ Run optimizer", type="primary")
+                r[2].number_input("Acceptance tolerance (% of target)", key="o_tolerance_pct",
+                                  min_value=0.0, max_value=1.0, step=0.1,
+                                  help="Relative. Applies to strength AND deflection. Accept if usage ≤ "
+                                       "target × (1 + tolerance/100). E.g. target 100%, tolerance 1 → 101%; "
+                                       "target 90%, tolerance 1 → 90.9%. Designs accepted above target are "
+                                       "flagged 'within tolerance'.")
+                r[3].number_input("Tie band (% of lightest)", key="o_tie_band_pct", step=0.5,
+                                  help="Designs within this % of the lightest are ranked by: fewer segments → "
+                                       "preferred lengths → weight → lower usage.")
+                r = st.columns(3)
+                r[0].number_input("Alternates to report", key="o_n_alternates", min_value=0, max_value=30, step=1)
+                r[1].number_input("Search time limit (min)", key="o_time_limit_min", min_value=1.0, step=1.0,
+                                  help="The search stops here and the result is flagged as truncated. "
+                                       "Final all-case verification is never cut short.")
+                r[2].checkbox("Log every candidate tried", key="o_log_all")
+                go_run = st.form_submit_button("▶ Run optimizer", type="primary")
 
             def _pos(txt):
                 out = []
@@ -716,7 +765,7 @@ with tab6:
                         out.append(int(float(x)))
                 return out
 
-            if go:
+            if go_run:
                 S = st.session_state
                 ov = {k: 'flange' for k in _pos(S.o_flange_at)}
                 ov.update({k: 'slip' for k in _pos(S.o_slip_at)})
@@ -734,23 +783,73 @@ with tab6:
                     lap_factor=S.o_lap_factor, lap_round=S.o_lap_round,
                     slip_clearance=S.o_slip_clearance, min_slip_above_gl=S.o_min_slip_above_gl,
                     strength_target=float(S.o_strength_target), defl_target=S.o_defl_target,
+                    tolerance_pct=float(S.o_tolerance_pct),
+                    long_tube_threshold_pct=float(S.o_long_tube_threshold_pct),
                     tie_band_pct=S.o_tie_band_pct, n_alternates=int(S.o_n_alternates),
-                    shear_mode=SHEAR, lap_stiffness=LAP)
+                    shear_mode=SHEAR, lap_stiffness=LAP,
+                    time_limit_s=float(S.o_time_limit_min) * 60.0)
+
+                run_hdr = st.empty()
+                run_hdr.subheader("Running")
                 bar = st.progress(0.0, text="Starting")
+                live = st.empty()
+                holder, last = [], [0.0]
+
                 def _prog(f, m):
                     bar.progress(min(max(f, 0.0), 1.0), text=m)
-                opt = Optimizer(base6, spec6, C6, _prog, log_all=bool(S.o_log_all))
-                res = opt.run()
-                bar.empty()
-                st.session_state["opt_result"] = dict(res=res, C=C6, log=opt.log, file=tmp_path)
+                    if not holder or _time.time() - last[0] < 1.0:
+                        return
+                    last[0] = _time.time()
+                    o = holder[0]
+                    el = _time.time() - o.t0
+                    with live.container():
+                        c = st.columns(5)
+                        c[0].metric("Phase", o.phase)
+                        c[1].metric("Elapsed", f"{el / 60:.1f} / {C6.time_limit_s / 60:.0f} min")
+                        c[2].metric("Evaluations", f"{o.n_evals:,}")
+                        c[3].metric("Passing designs found", f"{len(o.found):,}")
+                        if o.best_weight < float('inf'):
+                            d = o.best_weight - w_base
+                            c[4].metric("Best weight (screened, not yet verified)",
+                                        f"{o.best_weight:,.0f} lb",
+                                        f"{d:+,.0f} lb ({d / w_base * 100:+.1f}%) vs baseline",
+                                        delta_color="inverse")
+                        else:
+                            c[4].metric("Best weight (screened)", "—")
+
+                opt_real = Optimizer(base6, spec6, C6, _prog, log_all=bool(S.o_log_all))
+                holder.append(opt_real)
+                res = opt_real.run()
+                bar.empty(); live.empty(); run_hdr.empty()
+                st.session_state["opt_result"] = dict(res=res, C=C6, log=opt_real.log, file=tmp_path)
+                st.session_state.pop("opt_pick", None)
 
             R = st.session_state.get("opt_result")
             if R and R["file"] == tmp_path:
                 res, C6 = R["res"], R["C"]
-                w_base = _pw(spec6)['total_weight']
-                st.caption(f"{res['n_evals']} screening evaluations in {res['elapsed']:.0f} s. "
-                           f"Screening cases: {', '.join(res['screen_cases'])}. "
-                           "Every reported design was re-checked on ALL load cases, full mesh.")
+                B = res["baseline"]
+                if res.get("truncated"):
+                    st.warning("⚠️ Search stopped at the time / evaluation limit before all candidate "
+                               "combinations were examined. The designs below passed full verification, "
+                               "but a lighter design may exist. Increase the time limit or narrow the "
+                               "diameter ranges and re-run.")
+                else:
+                    st.success(f"Search completed in {res['elapsed']:.0f} s ({res['n_evals']:,} screening "
+                               "evaluations): every combination in the ranges was sized or ruled out.")
+                st.caption(f"Screening cases: {', '.join(res['screen_cases'])}. Every reported design "
+                           "was re-checked on ALL load cases, full mesh.")
+
+                st.subheader("Baseline and seed")
+                k = st.columns(4)
+                k[0].metric("Baseline shaft weight (engine)", f"{B['weight']:,.0f} lb")
+                k[1].metric("Baseline max strength / deflection",
+                            f"{B['strength']:.2f}% / " + (f"{B['defl']:.2f}%" if B['defl'] is not None else "—"))
+                if B['seed_weight'] is not None:
+                    k[2].metric("Seed after sizing", f"{B['seed_weight']:,.0f} lb",
+                                f"{B['seed_weight'] - B['weight']:+,.0f} lb", delta_color="inverse")
+                k[3].metric("Acceptance limit", f"{C6.strength_limit():.2f}% strength")
+                st.caption(f"Seed: {B['seed_note']}.")
+
                 win = res["winner"]
                 if win is None:
                     st.error("No design satisfied all constraints and load cases. "
@@ -760,56 +859,179 @@ with tab6:
                     st.subheader("Recommended design")
                     k = st.columns(5)
                     k[0].metric("Shaft weight", f"{win.weight:,.0f} lb",
-                                f"{win.weight - w_base:+,.0f} lb vs baseline", delta_color="inverse")
-                    k[1].metric("Saving", f"{(1 - win.weight / w_base) * 100:.1f}%")
+                                f"{win.weight - B['weight']:+,.0f} lb vs baseline", delta_color="inverse")
+                    k[1].metric("Saving vs baseline", f"{(1 - win.weight / B['weight']) * 100:.1f}%")
                     k[2].metric("Max strength", f"{win.strength:.2f}%")
                     k[3].metric("Max deflection", f"{win.defl:.2f}%" if win.defl is not None else "—")
                     k[4].metric("Governs", win.gov_check)
+                    if sw["acceptance"] == "within tolerance":
+                        st.info(f"Accepted within the {C6.tolerance_pct:g}% tolerance (usage above the "
+                                f"{C6.strength_target:g}% target).")
                     for f_, v_ in (("tip", sw["D tip (in)"]), ("base", sw["D base (in)"])):
                         lim = (C6.tip_min, C6.tip_max) if f_ == "tip" else (C6.base_min, C6.base_max)
                         if abs(v_ - lim[0]) < 1e-6 or abs(v_ - lim[1]) < 1e-6:
                             st.warning(f"{f_.capitalize()} diameter {v_} in is at the edge of the search "
                                        f"range {lim}. A lighter design may exist outside it.")
-                    lay_w = win.spec.layout()
                     st.dataframe(pd.DataFrame([{
                         "tube #": t['tube_no'], "length (ft)": t['length'], "thickness (in)": t['thickness'],
                         "D top (in)": round(t['d_top'], 3), "D bot (in)": round(t['d_bot'], 3),
                         "joint below": t['joint_type'], "lap (ft)": t['lap'],
                         "height AGL of tube top (ft)": round(win.spec.groundline_rel - t['start'], 2),
-                    } for t in lay_w]), width="stretch", hide_index=True)
+                    } for t in win.spec.layout()]), width="stretch", hide_index=True)
                     st.caption(f"Taper {win.spec.taper:.5f} in/ft (derived). "
                                f"{res.get('winner_variants', 0)} other tube-length arrangements of this "
                                "design also pass; the one shown ranks best on section lengths.")
 
+                # ---- long-tube rule table
+                st.subheader(f"Long-tube rule (X = {C6.long_tube_threshold_pct:g}%)")
+                st.dataframe(pd.DataFrame(res["long_table"]), width="stretch", hide_index=True)
+                st.caption("For each segment count: lightest verified design with standard lengths only vs "
+                           "lightest with a tube over the normal max. Long tubes are used only when the "
+                           "saving exceeds X.")
+
+                # ---- design scatter
+                kept = sorted(res.get("kept", []), key=lambda e: e.weight)
+                if win is not None:
+                    alts = [a for a, _, _ in res["alternates"]]
+                    ranked = [win] + alts
+                    others = [e for e in kept if all(e is not r_ for r_ in ranked)]
+                    labels = {id(win): "Recommended"}
+                    for i, a in enumerate(alts):
+                        labels[id(a)] = f"Rank {i + 2}"
+                    for e in others:
+                        labels[id(e)] = f"Other · {e.weight:,.0f} lb · D {e.design.tip}/{e.design.base}"
+                    pickable = ranked + others
+                    for e in res.get("dropped", []):
+                        labels[id(e)] = f"Excluded (long-tube rule) · {e.weight:,.0f} lb"
+                    pickable += list(res.get("dropped", []))
+                    gu = lambda e: max(e.strength, e.defl or 0.0)
+
+                    st.subheader("Design map — every fully verified design")
+                    fig = go.Figure()
+                    wmin, band = res["wmin"], res["band"]
+                    fig.add_hrect(y0=wmin, y1=band, fillcolor="green", opacity=0.08, line_width=0,
+                                  annotation_text=f"tie band ({C6.tie_band_pct:g}%)",
+                                  annotation_position="top left")
+                    fig.add_vline(x=C6.strength_target, line_dash="dash", line_color="red",
+                                  annotation_text="target")
+                    if C6.tolerance_pct > 0:
+                        fig.add_vline(x=C6.strength_limit(), line_dash="dot", line_color="orange",
+                                      annotation_text="tolerance")
+                    colors = {1: "#8c564b", 2: "#1f77b4", 3: "#2ca02c", 4: "#9467bd", 5: "#ff7f0e", 6: "#17becf"}
+                    idx_of = {id(e): i for i, e in enumerate(pickable)}
+                    def hover(e):
+                        s_ = summarize(e, C6)
+                        return (f"<b>{labels[id(e)]}</b><br>{e.weight:,.0f} lb "
+                                f"({(e.weight / B['weight'] - 1) * 100:+.1f}% vs baseline)<br>"
+                                f"D {s_['D tip (in)']} / {s_['D base (in)']} in, taper {s_['taper (in/ft)']}<br>"
+                                f"tubes {s_['tube lengths (ft)']} ft<br>t {s_['thickness (in)']} in<br>"
+                                f"strength {e.strength:.2f}%, defl "
+                                + (f"{e.defl:.2f}%" if e.defl is not None else "—")
+                                + f"<br>governs: {e.gov_check}")
+                    for n_ in sorted({e.design.n for e in kept}):
+                        for lng in (False, True):
+                            grp = [e for e in kept if e.design.n == n_ and
+                                   (length_class(e.spec, C6)['n_special'] > 0) == lng]
+                            if not grp:
+                                continue
+                            fig.add_trace(go.Scatter(
+                                x=[gu(e) for e in grp], y=[e.weight for e in grp], mode="markers",
+                                name=f"{n_} seg" + (" · long tube" if lng else ""),
+                                marker=dict(size=9, color=colors.get(n_, "gray"),
+                                            symbol="circle-open" if lng else "circle",
+                                            line=dict(width=2 if lng else 0.5, color=colors.get(n_, "gray"))),
+                                customdata=[idx_of[id(e)] for e in grp],
+                                hovertext=[hover(e) for e in grp], hoverinfo="text"))
+                    drp = list(res.get("dropped", []))
+                    if drp:
+                        fig.add_trace(go.Scatter(
+                            x=[gu(e) for e in drp], y=[e.weight for e in drp], mode="markers",
+                            name="excluded (long-tube rule)",
+                            marker=dict(size=8, color="lightgray", symbol="x"),
+                            customdata=[idx_of[id(e)] for e in drp],
+                            hovertext=[hover(e) for e in drp], hoverinfo="text"))
+                    fig.add_trace(go.Scatter(
+                        x=[gu(a) for a in alts], y=[a.weight for a in alts], mode="text",
+                        text=[str(i + 2) for i in range(len(alts))], textposition="top center",
+                        showlegend=False, hoverinfo="skip"))
+                    fig.add_trace(go.Scatter(
+                        x=[gu(win)], y=[win.weight], mode="markers+text", name="Recommended",
+                        marker=dict(size=18, color="gold", symbol="diamond", line=dict(width=1.5, color="black")),
+                        text=["1"], textposition="middle center", customdata=[idx_of[id(win)]],
+                        hovertext=[hover(win)], hoverinfo="text"))
+                    fig.add_trace(go.Scatter(
+                        x=[max(B['strength'], B['defl'] or 0)], y=[B['weight']], mode="markers",
+                        name="Baseline (XML)", marker=dict(size=18, color="red", symbol="star"),
+                        hovertext=[f"<b>Baseline</b><br>{B['weight']:,.0f} lb<br>strength "
+                                   f"{B['strength']:.2f}%"], hoverinfo="text"))
+                    fig.update_layout(height=520, xaxis_title="Governing usage (%) — max of strength and deflection",
+                                      yaxis_title="Shaft weight (lb)", legend=dict(orientation="h", y=-0.2),
+                                      margin=dict(t=30))
+                    ev = st.plotly_chart(fig, on_select="rerun", selection_mode="points", key="design_map",
+                                         width="stretch")
+                    st.caption("Click a point to load it into the detail check below. Hollow markers use a "
+                               "long tube; grey × were verified but excluded by the long-tube rule.")
+                    try:
+                        pts = ev.selection.points if ev and ev.selection else []
+                    except Exception:
+                        pts = []
+                    opts = [labels[id(e)] for e in pickable]
+                    if pts and pts[0].get("customdata") is not None:
+                        cd = pts[0]["customdata"]
+                        cd = cd[0] if isinstance(cd, (list, tuple)) else cd
+                        st.session_state["opt_pick"] = opts[int(cd)]
+
+                    # ---- convergence
+                    st.subheader("Convergence")
+                    hist = res.get("history", [])
+                    if hist:
+                        fig2 = go.Figure()
+                        xs = [h_[0] for h_ in hist] + [res["n_evals"]]
+                        ys = [h_[2] for h_ in hist] + [hist[-1][2]]
+                        fig2.add_trace(go.Scatter(x=xs, y=ys, mode="lines+markers", line_shape="hv",
+                                                  name="best screened weight",
+                                                  hovertext=[f"{h_[2]:,.0f} lb at eval {h_[0]} ({h_[1]:.0f} s)"
+                                                             for h_ in hist] + [""], hoverinfo="text"))
+                        fig2.add_hline(y=B['weight'], line_dash="dash", line_color="red",
+                                       annotation_text="baseline")
+                        fig2.add_hline(y=win.weight, line_dash="dot", line_color="green",
+                                       annotation_text="recommended (verified)")
+                        fig2.update_layout(height=360, xaxis_title="Screening evaluations",
+                                           yaxis_title="Shaft weight (lb)", margin=dict(t=30), showlegend=False)
+                        st.plotly_chart(fig2, width="stretch")
+                        st.caption("Best weight found during screening (5 governing cases) vs work done. "
+                                   "The recommended design can differ slightly: ranking applies the tie band "
+                                   "and length preferences, and only fully verified designs are eligible.")
+
+                    # ---- alternates table
+                    st.subheader(f"Next {len(res['alternates'])} designs and why they rank lower")
+                    st.dataframe(pd.DataFrame([{
+                        "rank": i + 2, **{k_: v_ for k_, v_ in summarize(a, C6).items() if k_ != "gov case"},
+                        "Δ weight (lb)": round(a.weight - win.weight),
+                        "why not preferred": why, "length variants": nv,
+                    } for i, (a, why, nv) in enumerate(res["alternates"])]), width="stretch", hide_index=True)
+
+                    # ---- baseline vs recommended
                     st.subheader("Baseline vs recommended")
                     st.dataframe(pd.DataFrame([
                         {"design": "Baseline (XML)", "D tip": spec6.tip_diameter,
                          "D base": round(spec6.base_diameter, 2), "taper": round(spec6.taper, 5),
                          "tubes (ft)": " / ".join(f"{t['length']:g}" for t in lay6),
                          "thickness (in)": " / ".join(f"{t['thickness']:g}" for t in lay6),
-                         "weight (lb)": round(w_base)},
+                         "weight (lb)": round(B['weight'])},
                         {"design": "Recommended", "D tip": sw["D tip (in)"], "D base": sw["D base (in)"],
                          "taper": sw["taper (in/ft)"], "tubes (ft)": sw["tube lengths (ft)"],
                          "thickness (in)": sw["thickness (in)"], "weight (lb)": sw["weight (lb)"]},
                     ]), width="stretch", hide_index=True)
 
-                    st.subheader(f"Next {len(res['alternates'])} designs and why they rank lower")
-                    st.dataframe(pd.DataFrame([{
-                        "rank": i + 2, **{k_: v_ for k_, v_ in summarize(a, C6).items()
-                                          if k_ not in ("gov case",)},
-                        "Δ weight (lb)": round(a.weight - win.weight),
-                        "why not preferred": why, "length variants": nv,
-                    } for i, (a, why, nv) in enumerate(res["alternates"])]),
-                        width="stretch", hide_index=True)
-                    if res["dropped"]:
-                        st.caption(f"{len(res['dropped'])} passing designs were excluded by the section-length "
-                                   "rule (tube > normal max at a segment count where a standard layout passes).")
-
+                    # ---- detail
                     st.subheader("Detail check")
-                    opts = ["Recommended"] + [f"Rank {i + 2}" for i in range(len(res["alternates"]))]
+                    if st.session_state.get("opt_pick") not in opts:
+                        st.session_state["opt_pick"] = opts[0]
                     pick = st.selectbox("Design", opts, key="opt_pick")
-                    e = win if pick == "Recommended" else res["alternates"][opts.index(pick) - 1][0]
+                    e = pickable[opts.index(pick)]
                     rr = e.result
+                    st.dataframe(pd.DataFrame([summarize(e, C6)]), width="stretch", hide_index=True)
                     st.dataframe(pd.DataFrame([{
                         "load case": c, "max strength %": round(x.max_strength, 2),
                         "at ht AGL (ft)": round(x.gov_row.get('height_agl', float('nan')), 2),
@@ -820,9 +1042,8 @@ with tab6:
                     cg = rr.cases[rr.gov_strength_case]
                     fig7, ax7 = plt.subplots(figsize=(7, 5))
                     for c, x in rr.cases.items():
-                        hh = [q['height_agl'] for q in x.rows]
-                        uu = [q['usage'] for q in x.rows]
-                        ax7.plot(uu, hh, linewidth=2 if c == cg.case else 0.6,
+                        ax7.plot([q['usage'] for q in x.rows], [q['height_agl'] for q in x.rows],
+                                 linewidth=2 if c == cg.case else 0.6,
                                  color='steelblue' if c == cg.case else 'lightgray')
                     ax7.axvline(C6.strength_target, color='red', linestyle='--', linewidth=1)
                     ax7.set_xlabel("Strength usage (%)"); ax7.set_ylabel("Height AGL (ft)")
@@ -837,7 +1058,7 @@ with tab6:
                     } for t in e.spec.layout()]).to_csv(index=False)
                     ce = st.columns(2)
                     ce[0].download_button("Tube table (CSV) for PLS-POLE re-verification", tube_csv,
-                                          file_name=f"{pick.replace(' ', '_')}_tubes.csv")
+                                          file_name=f"{pick.split(' ')[0]}_tubes.csv")
                     cons = {k_: (v_ if not isinstance(v_, tuple) else list(v_))
                             for k_, v_ in C6.__dict__.items()}
                     ce[1].download_button("Constraint set used (JSON)", json.dumps(cons, indent=2, default=str),
