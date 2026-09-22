@@ -90,6 +90,13 @@ class OptConstraints:
     len_special_max: float = 60.0
     len_step: float = 0.25
     min_tube: float = 15.0
+    #: Fixed bottom tube option (off by default). L is the FABRICATED length
+    #: of the bottom tube, embedment included. The tube directly above it
+    #: absorbs the remaining height on the 0.25 ft grid; if that tube cannot
+    #: fit, the segment count is infeasible and the search moves to n + 1.
+    fix_bottom: bool = False
+    bottom_length: float = 40.0
+    bottom_mode: str = 'exact'                # 'exact' or 'max'
     # joints
     joint_default: str = 'slip'               # 'slip' or 'flange'
     joint_overrides: Dict[int, str] = field(default_factory=dict)  # 1 = lowest joint
@@ -162,18 +169,55 @@ def make_spec(d: Design, H: float, emb: float, C: OptConstraints,
     taper = (d.base - d.tip + steps) / H
     if not (C.taper_min - 1e-9 <= taper <= C.taper_max + 1e-9):
         return None, f"taper {taper:.4f} outside [{C.taper_min}, {C.taper_max}]"
-    segs = [Segment(L, ts[k], fy=C.fy, joint_type=jt[k]) for k, L in enumerate(d.uppers)]
+    uppers = list(d.uppers)
+    flex = None
+    if uppers and uppers[-1] is None:
+        flex = len(uppers) - 1            # this tube absorbs the remainder
+        uppers[flex] = 30.0               # starting guess, solved below
+    segs = [Segment(L, ts[k], fy=C.fy, joint_type=jt[k]) for k, L in enumerate(uppers)]
     segs.append(Segment(30.0, ts[-1], fy=C.fy, joint_type='none'))
     spec = PoleSpec(tip_diameter=d.tip, taper=taper, segments=segs, embedment=emb,
                     slip_clearance=C.slip_clearance, lap_factor=C.lap_factor,
                     lap_round=C.lap_round)
+    if flex is not None:
+        # bottom fixed at L: solve the flexible tube for total height.
+        # laps depend on the lengths, so iterate (laps sit on the 0.25 ft
+        # grid, so this settles in a few passes).
+        Lb = C.bottom_length
+        prev = None
+        for _ in range(8):
+            laps = spec.laps()
+            need = round(H + sum(laps) - Lb - sum(uppers[k] for k in range(len(uppers))
+                                                  if k != flex), 4)
+            if need == prev:
+                break
+            prev = need
+            uppers[flex] = need
+            segs[flex] = Segment(max(need, 0.25), ts[flex], fy=C.fy, joint_type=jt[flex])
+            segs[-1] = Segment(Lb, ts[-1], fy=C.fy, joint_type='none')
+            spec = PoleSpec(tip_diameter=d.tip, taper=taper, segments=segs, embedment=emb,
+                            slip_clearance=C.slip_clearance, lap_factor=C.lap_factor,
+                            lap_round=C.lap_round)
+        if need < C.min_tube - 1e-9:
+            return None, f"tube above the fixed bottom {need:.2f} ft < min {C.min_tube}"
+        if need > C.len_special_max + 1e-9:
+            return None, f"tube above the fixed bottom {need:.2f} ft > max {C.len_special_max}"
+        uppers[flex] = need
     laps = spec.laps()
-    bottom = round(H - sum(d.uppers) + sum(laps), 4)
+    bottom = round(H - sum(uppers) + sum(laps), 4)
+    if C.fix_bottom:
+        Lb = C.bottom_length
+        if C.bottom_mode == 'exact' and abs(bottom - Lb) > 1e-6:
+            return None, f"bottom tube {bottom:.2f} ft != fixed {Lb:g} ft"
+        if bottom > Lb + 1e-6:
+            return None, f"bottom tube {bottom:.2f} ft > fixed max {Lb:g} ft"
     if bottom < C.min_tube - 1e-9:
         return None, f"bottom tube {bottom:.2f} ft < min {C.min_tube}"
     if bottom > C.len_special_max + 1e-9:
         return None, f"bottom tube {bottom:.2f} ft > max {C.len_special_max}"
     segs[-1] = Segment(bottom, ts[-1], fy=C.fy, joint_type='none')
+    for k in range(len(uppers)):
+        segs[k] = Segment(uppers[k], ts[k], fy=C.fy, joint_type=jt[k])
     spec = PoleSpec(tip_diameter=d.tip, taper=taper, segments=segs, embedment=emb,
                     slip_clearance=C.slip_clearance, lap_factor=C.lap_factor,
                     lap_round=C.lap_round)
@@ -284,6 +328,16 @@ class Optimizer:
             def possible(up, bottom_max):
                 lo = H - sum(up)                      # bottom length before laps
                 return lo + lap_hi >= C.min_tube and lo <= bottom_max
+            if C.fix_bottom:
+                # bottom is fixed; the tube directly above it is solved, so
+                # only tubes 1..n-2 are enumerated (None marks the solved one)
+                if n == 1:
+                    out.append(())
+                    continue
+                for u in itertools.product(values, repeat=n - 2):
+                    if sum(u) < H + 12.0 * nj:
+                        out.append(tuple(u) + (None,))
+                continue
             std = [u for u in itertools.product(
                        [v for v in values if v <= C.len_normal_max + 1e-9], repeat=n - 1)
                    if possible(u, C.len_normal_max)]
@@ -307,7 +361,7 @@ class Optimizer:
         C, G = self.C, self.G
         spec, why = make_spec(Design(d.tip, d.base, d.uppers, tuple([len(G) - 1] * d.n)),
                               self.H, self.emb, C, G)
-        if spec is None and not why.startswith('tube'):
+        if spec is None:
             spec, why = make_spec(Design(d.tip, d.base, d.uppers, tuple([0] * d.n)),
                                   self.H, self.emb, C, G)
             if spec is None:
@@ -506,7 +560,7 @@ class Optimizer:
             self.phase = label
             self.progress(f0 + (f1 - f0) * i / max(n, 1),
                           f"{label}: {i + 1}/{n}  D {d.tip}/{d.base}  tubes "
-                          f"{'/'.join(f'{x:g}' for x in d.uppers) or '-'}  "
+                          f"{'/'.join('auto' if x is None else f'{x:g}' for x in d.uppers) or '-'}  "
                           f"evals {self.n_evals}  best "
                           f"{min((x.weight for x in self.found.values()), default=float('nan')):,.0f} lb")
             self._record(self.size(d))
@@ -585,11 +639,13 @@ class Optimizer:
                       if C.base_min - 1e-9 <= b <= C.base_max + 1e-9]
             nlay = {d.uppers}
             for k in range(len(d.uppers)):
+                if d.uppers[k] is None:
+                    continue
                 for dl in (-1.0, -0.5, -0.25, 0.25, 0.5, 1.0):
                     L = round(d.uppers[k] + dl, 2)
                     if C.len_preferred - 1e-9 <= L <= C.len_special_max + 1e-9:
                         u = list(d.uppers); u[k] = L; nlay.add(tuple(u))
-            for c in self._combos(ntips, nbases, sorted(nlay)):
+            for c in self._combos(ntips, nbases, sorted(nlay, key=lambda u: tuple(-1 if x is None else x for x in u))):
                 key = (c[1].tip, c[1].base, c[1].uppers)
                 if key not in seen:
                     seen.add(key); fine.append(c)
