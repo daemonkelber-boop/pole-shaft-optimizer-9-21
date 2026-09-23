@@ -912,6 +912,12 @@ with tab6:
                         "joint below": t['joint_type'], "lap (ft)": t['lap'],
                         "height AGL of tube top (ft)": round(win.spec.groundline_rel - t['start'], 2),
                     } for t in win.spec.layout()]), width="stretch", hide_index=True)
+                    st.caption(
+                        f"**Total pole length {win.spec.total_length:.2f} ft — identical to the baseline "
+                        f"({spec6.total_length:.2f} ft).** The tube lengths sum to "
+                        f"{sum(t['length'] for t in win.spec.layout()):.2f} ft against "
+                        f"{sum(t['length'] for t in lay6):.2f} ft for the baseline; the difference is lap "
+                        "steel, which changes with the number and size of the slip joints.")
                     st.caption(f"Taper {win.spec.taper:.5f} in/ft (derived). "
                                f"{res.get('winner_variants', 0)} other tube-length arrangements of this "
                                "design also pass; the one shown ranks best on section lengths.")
@@ -1048,12 +1054,16 @@ with tab6:
                     # ---- baseline vs recommended
                     st.subheader("Baseline vs recommended")
                     st.dataframe(pd.DataFrame([
-                        {"design": "Baseline (XML)", "D tip": spec6.tip_diameter,
+                        {"design": "Baseline (XML)", "total length (ft)": round(spec6.total_length, 3),
+                         "fabricated steel (ft)": round(sum(t['length'] for t in lay6), 2),
+                         "segments": len(lay6), "D tip": spec6.tip_diameter,
                          "D base": round(spec6.base_diameter, 2), "taper": round(spec6.taper, 5),
                          "tubes (ft)": " / ".join(f"{t['length']:g}" for t in lay6),
                          "thickness (in)": " / ".join(f"{t['thickness']:g}" for t in lay6),
                          "weight (lb)": round(B['weight'])},
-                        {"design": "Recommended", "D tip": sw["D tip (in)"], "D base": sw["D base (in)"],
+                        {"design": "Recommended", "total length (ft)": sw["total length (ft)"],
+                         "fabricated steel (ft)": sw["fabricated steel (ft)"],
+                         "segments": sw["segments"], "D tip": sw["D tip (in)"], "D base": sw["D base (in)"],
                          "taper": sw["taper (in/ft)"], "tubes (ft)": sw["tube lengths (ft)"],
                          "thickness (in)": sw["thickness (in)"], "weight (lb)": sw["weight (lb)"]},
                     ]), width="stretch", hide_index=True)
@@ -1089,7 +1099,10 @@ with tab6:
                         "tube": t['tube_no'], "length_ft": t['length'], "thickness_in": t['thickness'],
                         "d_top_in": round(t['d_top'], 3), "d_bot_in": round(t['d_bot'], 3),
                         "joint_below": t['joint_type'], "lap_ft": t['lap'], "fy_ksi": t['fy'],
-                    } for t in e.spec.layout()]).to_csv(index=False)
+                    } for t in e.spec.layout()]).assign(
+                        total_length_ft=round(e.spec.total_length, 3),
+                        embedment_ft=e.spec.embedment,
+                        taper_in_per_ft=round(e.spec.taper, 5)).to_csv(index=False)
                     ce = st.columns(2)
                     ce[0].download_button("Tube table (CSV) for PLS-POLE re-verification", tube_csv,
                                           file_name=f"{pick.split(' ')[0]}_tubes.csv")

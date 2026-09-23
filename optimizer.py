@@ -854,11 +854,14 @@ def summarize(e: Evaluated, C: OptConstraints) -> dict:
     s = e.spec
     lay = s.layout()
     return {
+        "total length (ft)": round(s.total_length, 3),
+        "AGL height (ft)": round(s.agl_height, 3),
         "D tip (in)": s.tip_diameter, "D base (in)": round(s.base_diameter, 2),
         "taper (in/ft)": round(s.taper, 5), "segments": e.design.n,
         "tube lengths (ft)": " / ".join(f"{t['length']:g}" for t in lay),
         "thickness (in)": " / ".join(f"{t['thickness']:g}" for t in lay),
         "laps (ft)": " / ".join(f"{t['lap']:g}" for t in lay[:-1]) or "-",
+        "fabricated steel (ft)": round(sum(t['length'] for t in lay), 2),
         "joints": " / ".join(t['joint_type'] for t in lay[:-1]) or "-",
         "weight (lb)": round(e.weight, 0),
         "max strength %": round(e.strength, 2),
