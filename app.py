@@ -784,7 +784,11 @@ with tab6:
                 st.markdown("**Acceptance and ranking**")
                 r = st.columns(4)
                 r[0].selectbox("Strength usage target (%)", [100.0, 95.0, 90.0, 85.0], key="o_strength_target")
-                r[1].number_input("Deflection target (% of XML limit)", key="o_defl_target", step=5.0)
+                r[1].number_input("Deflection target (% of XML limit)", key="o_defl_target",
+                                  min_value=0.0, step=5.0,
+                                  help="Percent of each load case's own deflection limit from the XML. "
+                                       "100 = use the limit as written. Set to 0 to switch the deflection "
+                                       "check OFF entirely (designs are then accepted on strength alone).")
                 r[2].number_input("Acceptance tolerance (% of target)", key="o_tolerance_pct",
                                   min_value=0.0, max_value=1.0, step=0.1,
                                   help="Relative. Applies to strength AND deflection. Accept if usage ≤ "
@@ -912,6 +916,10 @@ with tab6:
                 k[3].metric("Acceptance limit", f"{C6.strength_limit():.2f}% strength")
                 st.caption(f"Seed: {B['seed_note']}.")
 
+                if C6.defl_target <= 0:
+                    st.error("Deflection target is 0, so the deflection check was DISABLED for this run. "
+                             "Designs below were accepted on strength alone and may exceed the deflection "
+                             "limits in the XML. Set the target to 100 to enforce them.")
                 win = res["winner"]
                 if win is None:
                     st.error("No design satisfied all constraints and load cases. "

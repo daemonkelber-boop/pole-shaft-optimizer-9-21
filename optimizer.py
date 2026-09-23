@@ -131,10 +131,18 @@ class OptConstraints:
     time_limit_s: float = 900.0               # wall-clock cap for the search phases
 
     def strength_limit(self) -> float:
+        if self.strength_target <= 0:
+            return float('inf')
         return self.strength_target * (1.0 + self.tolerance_pct / 100.0)
 
     def defl_limit(self) -> float:
+        # target <= 0 means "no deflection limit" -> nothing can fail on it
+        if self.defl_target <= 0:
+            return float('inf')
         return self.defl_target * (1.0 + self.tolerance_pct / 100.0)
+
+    def defl_disabled(self) -> bool:
+        return self.defl_target <= 0
 
     def gauges(self) -> List[float]:
         if self.t_list:
@@ -309,7 +317,7 @@ class Optimizer:
         self.env_s, self.env_M = env_s, env
         # deflection-limited cases: moment diagrams + allowable tip deflection
         self.defl_cases = []
-        for x in b.cases.values():
+        for x in ([] if C.defl_disabled() else b.cases.values()):
             dc = x.defl_check
             if dc and dc.get('allowable_ft'):
                 allow = dc['allowable_ft'] * C.defl_target / 100.0
@@ -479,8 +487,9 @@ class Optimizer:
                                keep_rows=full)
         w = pole_weight(spec, n_steps=40)['total_weight']
         dmax = r.max_defl_usage
-        gov_check = 'deflection' if (dmax or 0) / C.defl_target > r.max_strength / C.strength_target \
-            else 'strength'
+        d_ratio = (dmax or 0.0) / C.defl_target if C.defl_target > 0 else 0.0
+        s_ratio = r.max_strength / C.strength_target if C.strength_target > 0 else 0.0
+        gov_check = 'deflection' if d_ratio > s_ratio else 'strength'
         e = Evaluated(d, spec, w, r.max_strength, dmax,
                       r.gov_defl_case if gov_check == 'deflection' else r.gov_strength_case,
                       gov_check, verified=full, result=r if full else None)
@@ -793,7 +802,8 @@ class Optimizer:
         def key(e):
             lc = length_class(e.spec, C)
             in_band = e.weight <= band + 1e-9
-            gu = max(e.strength / C.strength_target, (e.defl or 0) / C.defl_target)
+            gu = max(e.strength / C.strength_target if C.strength_target > 0 else 0.0,
+                     (e.defl or 0) / C.defl_target if C.defl_target > 0 else 0.0)
             if in_band:
                 return (0, e.design.n, lc['n_special'], lc['deviation'], e.weight, gu)
             return (1, e.weight, e.design.n, lc['n_special'], lc['deviation'], gu)
