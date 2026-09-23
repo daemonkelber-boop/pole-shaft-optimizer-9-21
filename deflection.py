@@ -76,6 +76,7 @@ class DeflectionResult:
     iterations: int
     converged: bool
     agl_height: float
+    pole_length: float       # ft, tip to butt (basis for '% Pole Length' checks)
     # final load state (sorted by key), for exact section forces anywhere
     _key: np.ndarray = None
     _F: np.ndarray = None
@@ -282,6 +283,7 @@ def solve_deflection(model: LoadModel, ds: float = 0.25,
                             dz=z - u, thx=thx, thy=thy, Mx=Mx, My=My, P=P, Vy=Vy, Vx=Vx, T=T,
                             iterations=it, converged=converged,
                             agl_height=spec.agl_height,
+                            pole_length=spec.total_length,
                             _key=key, _F=F_all, _LX=LX, _LY=LY, _LZ=LZ)
 
 
@@ -303,8 +305,14 @@ def deflection_check(res: DeflectionResult, check_type: str,
     ct = check_type.strip().lower()
     if ct == '% pole height':
         allow_ft = limit / 100.0 * res.agl_height
-        return dict(check=check_type, limit=limit, allowable_ft=allow_ft,
-                    actual_ft=actual_ft, usage=actual_ft / allow_ft * 100.0)
-    return dict(check=check_type, limit=limit, allowable_ft=None,
-                actual_ft=actual_ft, usage=None,
-                note=f"check type '{check_type}' not implemented")
+    elif ct == '% pole length':
+        # PLS-POLE '% Pole Length': limit % of the total pole length
+        # (tip to butt). Verified against the XML usage table, e.g.
+        # limit 10 on a 110 ft pole -> allowable 11.00 ft.
+        allow_ft = limit / 100.0 * res.pole_length
+    else:
+        return dict(check=check_type, limit=limit, allowable_ft=None,
+                    actual_ft=actual_ft, usage=None,
+                    note=f"check type '{check_type}' not implemented")
+    return dict(check=check_type, limit=limit, allowable_ft=allow_ft,
+                actual_ft=actual_ft, usage=actual_ft / allow_ft * 100.0)

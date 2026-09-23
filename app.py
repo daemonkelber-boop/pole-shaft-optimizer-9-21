@@ -543,7 +543,11 @@ with tab5:
                 k[2].metric("Governing case", cand5.gov_defl_case)
             else:
                 st.info("No load case in this XML has a deflection limit.")
-            st.caption(f"Deflection limit basis: above-ground height = {spec5.agl_height:.2f} ft. "
+            dc5 = cand5.cases.get(cand5.gov_defl_case).defl_check if cand5.gov_defl_case else None
+            basis5 = (f"pole length = {spec5.total_length:.2f} ft"
+                      if dc5 and 'length' in str(dc5.get('check', '')).lower()
+                      else f"above-ground height = {spec5.agl_height:.2f} ft")
+            st.caption(f"Deflection limit basis: {basis5}. "
                        f"Lap stiffness: {LAP}.")
 
             st.subheader("All load cases — tip deflection")
