@@ -52,6 +52,20 @@ def load_baseline(path):
     from loads import Baseline
     return Baseline.from_xml(path)
 
+def xml_lap_gap(tubes) -> float:
+    """PLS-POLE 'Lap Gap or Butt Offset' (in) — the gap on ONE side between
+    the male outside face and the female inside face. The diameter step at a
+    slip joint is 2 x t_female + 2 x gap. PLS rounds the export to 3 dp
+    (0.063), so a value within 0.002 of 1/16 in is taken as 0.0625."""
+    from pls_pole_xml_parser import get_field as gf
+    vals = [gf(t, 'lap_gap_or_butt_offset') or 0.0 for t in tubes
+            if (gf(t, 'lap_length') or 0.0) > 0]
+    if not vals:
+        return 0.0625
+    g = max(set(vals), key=vals.count)
+    return 0.0625 if abs(g - 0.0625) < 0.002 else g
+
+
 def build_spec(p):
     from pls_pole_xml_parser import get_field as gf, get_single_table as gst
     from geometry import PoleSpec, Segment
@@ -67,11 +81,13 @@ def build_spec(p):
         lap = gf(t, 'lap_length') or 0.0
         segs.append(Segment(length=gf(t, 'length'), thickness=gf(t, 'thickness'),
                             fy=gf(t, 'yield_stress') or 65.0,
-                            joint_type='slip' if lap > 0 else 'flange'))
+                            joint_type='slip' if lap > 0 else 'flange',
+                            lap_override=lap if lap > 0 else None))
     return PoleSpec(label=prop.get('steel_pole_property_label', ''),
                     tip_diameter=gf(prop, 'tip_diameter'),
                     taper=gf(tubes[0], 'calculated_taper'),
-                    segments=segs, embedment=emb)
+                    segments=segs, embedment=emb,
+                    slip_clearance=2.0 * xml_lap_gap(tubes))
 
 @st.cache_resource(show_spinner=False)
 def run_candidate(path, br, shear, lap):
@@ -651,6 +667,12 @@ with tab6:
                     plate_note = f"base plate {plate_w:,.0f} lb removed"
             pls_shaft = (pls_total - plate_w) if pls_total else None
 
+            xml_len6 = _gf6(_gst6(p6, 'steel_pole_properties')[0], 'length')
+            if xml_len6 and abs(spec6.total_length - xml_len6) > 0.01:
+                st.warning(f"Rebuilt baseline is {spec6.total_length:.2f} ft but the XML reports "
+                           f"{xml_len6:.2f} ft. Candidates are held to {spec6.total_length:.2f} ft. "
+                           "Check the tube lengths and lap lengths in the model.")
+
             st.subheader("Starting point (baseline XML, shaft only)")
             b_ = st.columns(3)
             b_[0].metric("Engine shaft weight", f"{w_base:,.0f} lb",
@@ -670,7 +692,8 @@ with tab6:
                 len_special_max=60.0, min_tube=15.0,
                 fix_bottom=False, bottom_length=40.0, bottom_mode="exactly L", joint_default="slip",
                 flange_at=base_flange, slip_at="", lap_factor=1.65, lap_round=0.25,
-                slip_clearance=0.125, min_slip_above_gl=0.0, fy=65.0,
+                slip_clearance=xml_lap_gap(_gst6(p6, 'steel_tubes_properties')),
+                min_slip_above_gl=0.0, fy=65.0,
                 strength_target=100.0, defl_target=100.0, tolerance_pct=0.0,
                 long_tube_threshold_pct=2.0, tie_band_pct=1.0,
                 n_alternates=10, log_all=False, time_limit_min=15.0, max_evals=200000)
@@ -749,7 +772,12 @@ with tab6:
                 r[0].number_input("Lap factor (× female ID)", key="o_lap_factor", step=0.05, format="%.3f",
                                   help="1.65 = 1.1 × 1.5")
                 r[1].number_input("Lap rounding up to (ft)", key="o_lap_round", step=0.25)
-                r[2].number_input("Slip clearance (in)", key="o_slip_clearance", step=0.0625, format="%.4f")
+                r[2].number_input("Lap gap / butt offset (in, per side)", key="o_slip_clearance",
+                                  step=0.0625, format="%.4f",
+                                  help="Same quantity as PLS-POLE's 'Lap Gap or Butt Offset' column: the "
+                                       "gap on ONE side between the male outside face and the female "
+                                       "inside face. The diameter step at a slip joint is "
+                                       "2 x t_female + 2 x gap. Default is read from the uploaded XML.")
                 r[3].number_input("Lowest slip joint above GL (ft)", key="o_min_slip_above_gl", step=1.0,
                                   help="Clearance from the ground line up to the BOTTOM OF THE LAP of the lowest slip joint (the female tube's lower end), not the joint itself. Default 0 = no requirement. Example (011): joint at 15.0 ft AGL, lap bottom at 7.5 ft AGL.")
 
@@ -803,7 +831,7 @@ with tab6:
                     bottom_mode=('exact' if S.o_bottom_mode == 'exactly L' else 'max'),
                     joint_default=S.o_joint_default, joint_overrides=ov,
                     lap_factor=S.o_lap_factor, lap_round=S.o_lap_round,
-                    slip_clearance=S.o_slip_clearance, min_slip_above_gl=S.o_min_slip_above_gl,
+                    slip_clearance=2.0 * S.o_slip_clearance, min_slip_above_gl=S.o_min_slip_above_gl,
                     strength_target=float(S.o_strength_target), defl_target=S.o_defl_target,
                     tolerance_pct=float(S.o_tolerance_pct),
                     long_tube_threshold_pct=float(S.o_long_tube_threshold_pct),

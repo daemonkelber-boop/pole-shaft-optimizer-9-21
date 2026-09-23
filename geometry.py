@@ -90,7 +90,7 @@ class DesignLimits:
 
     taper_min: float = 0.15               # in/ft
     taper_max: float = 0.50               # in/ft
-    max_wt: float = 35.0                  # max w/t ratio
+    max_wt: float = 38.0                  # max w/t ratio
     max_segments: int = 6
     #: Section lengths in order of preference; the last value is the hard max.
     preferred_lengths: tuple = (53.0, 57.0, 60.0)
@@ -125,6 +125,11 @@ class Segment:
     #: 'slip' or 'flange'. The joint at this tube's BOTTOM end. The lowest
     #: tube has no joint below it, so its value is ignored.
     joint_type: str = 'slip'
+    #: lap length (ft) taken from a PLS-POLE export. When set, it overrides
+    #: the computed lap rule -- used to reproduce a baseline model EXACTLY,
+    #: including models whose lap was entered by hand. Candidate designs
+    #: leave this None so the lap rule applies.
+    lap_override: Optional[float] = None
     #: Only used when the joint ABOVE this tube is a flange. A flange
     #: connection does not force diameter continuity -- the tubes are
     #: separate pieces bolted together, and the lower tube's top diameter
@@ -182,7 +187,9 @@ class PoleSpec:
                 lap, joint = 0.0, 'none'
             elif seg.joint_type == 'slip':
                 female_id_ft = (d_bot - 2.0 * seg.thickness) / 12.0
-                lap, joint = slip_joint_lap(female_id_ft, self.lap_factor, self.lap_round), 'slip'
+                lap = (seg.lap_override if seg.lap_override is not None
+                       else slip_joint_lap(female_id_ft, self.lap_factor, self.lap_round))
+                joint = 'slip'
             else:
                 lap, joint = 0.0, seg.joint_type
 
