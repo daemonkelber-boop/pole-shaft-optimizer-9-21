@@ -501,7 +501,7 @@ class Optimizer:
     def _log(self, d, e, status, r=None):
         if not self.log_all:
             return
-        self.log.append(dict(tip=d.tip, base=d.base, tubes='/'.join(f"{x:g}" for x in d.uppers),
+        self.log.append(dict(tip=d.tip, base=d.base, tubes='/'.join('auto' if x is None else f"{x:g}" for x in d.uppers),
                              thick='/'.join(f"{self.G[i]:g}" for i in d.ts),
                              weight=round(e.weight, 1) if e else None,
                              strength=round(r.max_strength, 2) if r else None,
