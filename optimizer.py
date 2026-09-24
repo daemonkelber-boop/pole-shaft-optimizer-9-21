@@ -90,6 +90,10 @@ class OptConstraints:
     len_special_max: float = 60.0
     len_step: float = 0.25
     min_tube: float = 15.0
+    # thickness-dependent section length limits (optional)
+    # mapping of {thickness_in: max_length_ft}, e.g. {0.75: 50.0}
+    max_len_by_thick: Dict[float, float] = field(default_factory=dict)
+    thick_len_mode: str = 'gte'                # 'gte' (>= thickness) or 'exact'
     #: Fixed bottom tube option (off by default). L is the FABRICATED length
     #: of the bottom tube, embedment included. The tube directly above it
     #: absorbs the remaining height on the 0.25 ft grid; if that tube cannot
@@ -153,6 +157,20 @@ class OptConstraints:
     def joint_type(self, pos_from_bottom: int) -> str:
         return self.joint_overrides.get(pos_from_bottom, self.joint_default)
 
+    def max_length_for_thickness(self, t: float) -> Optional[float]:
+        """Return maximum allowable section length for thickness t, or None if unconstrained."""
+        if not self.max_len_by_thick:
+            return None
+        limits = []
+        for rule_t, max_l in self.max_len_by_thick.items():
+            if self.thick_len_mode == 'gte':
+                if t >= rule_t - 1e-6:
+                    limits.append(max_l)
+            else:
+                if abs(t - rule_t) < 1e-4:
+                    limits.append(max_l)
+        return min(limits) if limits else None
+
 
 # --------------------------------------------------------------------------
 # Candidate construction
@@ -171,7 +189,7 @@ class Design:
 
 
 def make_spec(d: Design, H: float, emb: float, C: OptConstraints,
-              G: List[float]) -> Tuple[Optional[PoleSpec], str]:
+              G: List[float], check_thick_len: bool = True) -> Tuple[Optional[PoleSpec], str]:
     """Build a PoleSpec from a Design, or return (None, reason)."""
     n = d.n
     ts = [G[i] for i in d.ts]
@@ -237,6 +255,11 @@ def make_spec(d: Design, H: float, emb: float, C: OptConstraints,
         wt = w_over_t(tb['d_bot'], tb['thickness'], C.bend_radius_factor)
         if wt > C.max_wt + 1e-9:
             return None, f"tube {tb['tube_no']} w/t {wt:.1f} > {C.max_wt}"
+    if check_thick_len and C.max_len_by_thick:
+        for tb in lay:
+            cap = C.max_length_for_thickness(tb['thickness'])
+            if cap is not None and tb['length'] > cap + 1e-6:
+                return None, f"tube {tb['tube_no']} length {tb['length']:.2f} ft > max {cap:g} ft for thickness {tb['thickness']:g}\""
     slips = [tb for tb in lay if tb['joint_type'] == 'slip']
     if slips:
         low = max(slips, key=lambda tb: tb['lap_bottom'])
@@ -410,10 +433,10 @@ class Optimizer:
         orders the search; it never accepts a design."""
         C, G = self.C, self.G
         spec, why = make_spec(Design(d.tip, d.base, d.uppers, tuple([len(G) - 1] * d.n)),
-                              self.H, self.emb, C, G)
+                              self.H, self.emb, C, G, check_thick_len=False)
         if spec is None:
             spec, why = make_spec(Design(d.tip, d.base, d.uppers, tuple([0] * d.n)),
-                                  self.H, self.emb, C, G)
+                                  self.H, self.emb, C, G, check_thick_len=False)
             if spec is None:
                 return None, ()
         lay = spec.layout()
@@ -465,6 +488,11 @@ class Optimizer:
         if t.max() > G[-1] + 1e-9:
             return None, ()
         idx = tuple(next(i for i, g in enumerate(G) if g >= tk - 1e-9) for tk in t)
+        if C.max_len_by_thick:
+            for k, tb in enumerate(lay):
+                cap = C.max_length_for_thickness(G[idx[k]])
+                if cap is not None and tb['length'] > cap + 1e-6:
+                    return None, ()
         return float(np.dot(c_w, t)), idx
 
     def _eval(self, d: Design, full: bool = False) -> Tuple[Optional[Evaluated], str]:
@@ -519,11 +547,16 @@ class Optimizer:
 
     def _defl_tube(self, d: Design) -> int:
         """Tube whose stiffening reduces tip deflection most per lb added."""
-        spec, _ = make_spec(d, self.H, self.emb, self.C, self.G)
-        best, bi = -1.0, d.n - 1
+        spec, _ = make_spec(d, self.H, self.emb, self.C, self.G, check_thick_len=False)
+        best, bi = -1.0, -1
         for k, tb in enumerate(spec.layout()):
             if d.ts[k] >= len(self.G) - 1:
                 continue
+            if self.C.max_len_by_thick:
+                next_t = self.G[d.ts[k] + 1]
+                cap = self.C.max_length_for_thickness(next_t)
+                if cap is not None and tb['length'] > cap + 1e-6:
+                    continue
             lo, hi = tb['start'], min(tb['end'], spec.groundline_rel)
             ss = np.linspace(lo, hi, 8)
             M = np.interp(ss, self.env_s, self.env_M)
@@ -553,6 +586,8 @@ class Optimizer:
                 k = int(why.split(':')[1]) - 1
             elif why == 'deflection':
                 k = self._defl_tube(Design(d.tip, d.base, d.uppers, tuple(ts)))
+                if k < 0:
+                    return None
             elif why.startswith('tube') and 'w/t' in why:
                 k = int(why.split()[1]) - 1
             else:
@@ -863,7 +898,7 @@ class Optimizer:
 def summarize(e: Evaluated, C: OptConstraints) -> dict:
     s = e.spec
     lay = s.layout()
-    return {
+    res = {
         "total length (ft)": round(s.total_length, 3),
         "AGL height (ft)": round(s.agl_height, 3),
         "D tip (in)": s.tip_diameter, "D base (in)": round(s.base_diameter, 2),
@@ -881,3 +916,7 @@ def summarize(e: Evaluated, C: OptConstraints) -> dict:
                                                (e.defl or 0) > C.defl_target + 1e-9) else "at/below target"),
         "long tube": "yes" if length_class(e.spec, C)['n_special'] else "no",
     }
+    if C.max_len_by_thick:
+        sym = "≥" if C.thick_len_mode == 'gte' else "="
+        res["t-length limits"] = ", ".join(f"t {sym} {tk:g}\" ≤ {ml:g} ft" for tk, ml in sorted(C.max_len_by_thick.items()))
+    return res

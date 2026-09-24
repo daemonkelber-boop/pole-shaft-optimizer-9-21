@@ -687,6 +687,28 @@ with tab6:
             st.caption(f"PLS-POLE reported {pls_total:,.1f} lb; {plate_note}. "
                        "All savings below are measured against the engine shaft weight." if pls_total else "")
 
+            def _parse_thick_len(txt):
+                out = {}
+                if not txt or not str(txt).strip():
+                    return out, None
+                for part in str(txt).replace(";", ",").split(","):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    delim = ':' if ':' in part else ('=' if '=' in part else None)
+                    if not delim:
+                        return {}, f"Invalid rule format '{part}'. Use 'thickness: max_length' (e.g. '0.75: 50')."
+                    lhs, rhs = part.split(delim, 1)
+                    try:
+                        t = float(lhs.strip().replace('"', '').replace("in", ""))
+                        ml = float(rhs.strip().replace("'", "").replace("ft", ""))
+                        if t <= 0 or ml <= 0:
+                            return {}, f"Thickness and length must be positive numbers in '{part}'."
+                        out[round(t, 4)] = round(ml, 2)
+                    except ValueError:
+                        return {}, f"Could not parse numeric values in '{part}'. Use format '0.75: 50'."
+                return out, None
+
             DEF = dict(
                 tip_min=10.0, tip_max=half(spec6.tip_diameter + 7), tip_inc=0.5,
                 base_min=half(max(spec6.base_diameter - 15, 20)), base_max=half(spec6.base_diameter + 10),
@@ -694,6 +716,7 @@ with tab6:
                 t_list="0.1875, 0.25, 0.3125, 0.375, 0.4375, 0.5", taper_min=0.15, taper_max=0.50,
                 max_wt=38.0, max_segments=6, len_preferred=53.0, len_normal_max=57.0,
                 len_special_max=60.0, min_tube=15.0,
+                thick_len_rules="", thick_len_mode="Thickness and heavier (>=)",
                 fix_bottom=False, bottom_length=40.0, bottom_mode="exactly L", joint_default="slip",
                 flange_at=base_flange, slip_at="", lap_factor=1.65, lap_round=0.25,
                 slip_clearance=xml_lap_gap(_gst6(p6, 'steel_tubes_properties')),
@@ -740,6 +763,25 @@ with tab6:
                 r[2].number_input("Normal max length (ft)", key="o_len_normal_max", step=0.25)
                 r[3].number_input("Long-tube max length (ft)", key="o_len_special_max", step=0.25)
                 r[4].number_input("Min tube length (ft)", key="o_min_tube", step=0.25)
+
+                r_tl = st.columns([2, 1.2])
+                r_tl[0].text_input("Max section length by thickness (optional)", key="o_thick_len_rules",
+                                   placeholder="e.g. 0.75: 50, 0.875: 40",
+                                   help="Comma-separated 'thickness: max_length' (e.g. '0.75: 50, 0.875: 40'). Caps fabricated section length for given wall thickness (in : ft).")
+                r_tl[1].radio("Rule applies to", ["Thickness and heavier (>=)", "Exact thickness only (=)"],
+                              key="o_thick_len_mode", horizontal=True)
+                st.caption(
+                    "**Thickness-dependent section length limit (optional).** Press brake forming capacity drops for heavy plates. "
+                    "For example, entering `0.75: 50` guarantees that any pole section with wall thickness ≥ 0.75\" cannot exceed 50.0 ft. "
+                    "Multiple tiers can be entered (e.g. `0.625: 55, 0.75: 50, 0.875: 40`). Leave blank for unconstrained lengths.")
+                curr_rules, curr_err = _parse_thick_len(st.session_state.get("o_thick_len_rules", ""))
+                if curr_err:
+                    st.warning(f"⚠️ {curr_err}")
+                elif curr_rules:
+                    sym_ = "≥" if st.session_state.get("o_thick_len_mode") == "Thickness and heavier (>=)" else "="
+                    badges_ = "  |  ".join(f"t {sym_} {t_:g}\" → max {ml_:g} ft" for t_, ml_ in sorted(curr_rules.items()))
+                    st.info(f"🎯 **Active thickness constraints:** {badges_}")
+
                 r2 = st.columns([1, 1, 1.4])
                 r2[0].checkbox("Fix bottom tube length", key="o_fix_bottom")
                 r2[1].number_input("Bottom tube length L (ft)", key="o_bottom_length", step=0.25,
@@ -825,6 +867,7 @@ with tab6:
                 S = st.session_state
                 ov = {k: 'flange' for k in _pos(S.o_flange_at)}
                 ov.update({k: 'slip' for k in _pos(S.o_slip_at)})
+                tl_map, _ = _parse_thick_len(S.o_thick_len_rules)
                 C6 = OptConstraints(
                     tip_min=S.o_tip_min, tip_max=S.o_tip_max, tip_inc=S.o_tip_inc,
                     base_min=S.o_base_min, base_max=S.o_base_max, base_inc=S.o_base_inc,
@@ -835,6 +878,8 @@ with tab6:
                     bend_radius_factor=BR, fy=S.o_fy, max_segments=int(S.o_max_segments),
                     len_preferred=S.o_len_preferred, len_normal_max=S.o_len_normal_max,
                     len_special_max=S.o_len_special_max, min_tube=S.o_min_tube,
+                    max_len_by_thick=tl_map,
+                    thick_len_mode=('gte' if S.o_thick_len_mode == "Thickness and heavier (>=)" else 'exact'),
                     fix_bottom=bool(S.o_fix_bottom), bottom_length=float(S.o_bottom_length),
                     bottom_mode=('exact' if S.o_bottom_mode == 'exactly L' else 'max'),
                     joint_default=S.o_joint_default, joint_overrides=ov,
@@ -946,12 +991,21 @@ with tab6:
                         if abs(v_ - lim[0]) < 1e-6 or abs(v_ - lim[1]) < 1e-6:
                             st.warning(f"{f_.capitalize()} diameter {v_} in is at the edge of the search "
                                        f"range {lim}. A lighter design may exist outside it.")
-                    st.dataframe(pd.DataFrame([{
+                    cols = [{
                         "tube #": t['tube_no'], "length (ft)": t['length'], "thickness (in)": t['thickness'],
                         "D top (in)": round(t['d_top'], 3), "D bot (in)": round(t['d_bot'], 3),
                         "joint below": t['joint_type'], "lap (ft)": t['lap'],
                         "height AGL of tube top (ft)": round(win.spec.groundline_rel - t['start'], 2),
-                    } for t in win.spec.layout()]), width="stretch", hide_index=True)
+                    } for t in win.spec.layout()]
+                    if C6.max_len_by_thick:
+                        for row in cols:
+                            cap_val = C6.max_length_for_thickness(row["thickness (in)"])
+                            row["max allowed length (ft)"] = f"{cap_val:g}" if cap_val is not None else "—"
+                    st.dataframe(pd.DataFrame(cols), width="stretch", hide_index=True)
+                    if C6.max_len_by_thick:
+                        sym_ = "≥" if C6.thick_len_mode == 'gte' else "="
+                        st.caption(f"**Enforced thickness-length constraints:** " +
+                                   ", ".join(f"t {sym_} {tk:g}\" ≤ {ml:g} ft" for tk, ml in sorted(C6.max_len_by_thick.items())))
                     st.caption(
                         f"**Total pole length {win.spec.total_length:.2f} ft — identical to the baseline "
                         f"({spec6.total_length:.2f} ft).** The tube lengths sum to "
