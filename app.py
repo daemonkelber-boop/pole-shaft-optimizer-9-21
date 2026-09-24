@@ -898,8 +898,8 @@ with tab6:
                     li = S.get(f"o_rule_l_{i}", 0.0)
                     if ti and li and float(ti) > 0 and float(li) > 0:
                         tl_map[round(float(ti), 4)] = round(float(li), 2)
-                if not tl_map and S.get("o_thick_len_rules"):
-                    tl_map, _ = _parse_thick_len(S.get("o_thick_len_rules"))
+                # (o_thick_len_rules was removed in favour of the structured
+                # rule_t_1..4 / rule_l_1..4 inputs — no fallback needed)
                 C6 = OptConstraints(
                     tip_min=S.o_tip_min, tip_max=S.o_tip_max, tip_inc=S.o_tip_inc,
                     base_min=S.o_base_min, base_max=S.o_base_max, base_inc=S.o_base_inc,
