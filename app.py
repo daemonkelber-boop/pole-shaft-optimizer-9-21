@@ -643,9 +643,11 @@ with tab6:
         st.info("Upload a PLS-POLE XML file in the sidebar to begin.")
     else:
         try:
-            import json, math as _m, time as _time
+            import json, math as _m, time as _time, importlib
             import plotly.graph_objects as go
             from pls_pole_xml_parser import get_single_table as _gst6, get_field as _gf6
+            import optimizer as _opt_mod
+            importlib.reload(_opt_mod)
             from optimizer import Optimizer, OptConstraints, summarize, length_class
             from weight import pole_weight as _pw
 
@@ -716,7 +718,11 @@ with tab6:
                 t_list="0.1875, 0.25, 0.3125, 0.375, 0.4375, 0.5", taper_min=0.15, taper_max=0.50,
                 max_wt=38.0, max_segments=6, len_preferred=53.0, len_normal_max=57.0,
                 len_special_max=60.0, min_tube=15.0,
-                thick_len_rules="", thick_len_mode="Thickness and heavier (>=)",
+                thick_len_mode="Thickness and heavier (>=)",
+                rule_t_1=0.0, rule_l_1=0.0,
+                rule_t_2=0.0, rule_l_2=0.0,
+                rule_t_3=0.0, rule_l_3=0.0,
+                rule_t_4=0.0, rule_l_4=0.0,
                 fix_bottom=False, bottom_length=40.0, bottom_mode="exactly L", joint_default="slip",
                 flange_at=base_flange, slip_at="", lap_factor=1.65, lap_round=0.25,
                 slip_clearance=xml_lap_gap(_gst6(p6, 'steel_tubes_properties')),
@@ -764,23 +770,42 @@ with tab6:
                 r[3].number_input("Long-tube max length (ft)", key="o_len_special_max", step=0.25)
                 r[4].number_input("Min tube length (ft)", key="o_min_tube", step=0.25)
 
-                r_tl = st.columns([2, 1.2])
-                r_tl[0].text_input("Max section length by thickness (optional)", key="o_thick_len_rules",
-                                   placeholder="e.g. 0.75: 50, 0.875: 40",
-                                   help="Comma-separated 'thickness: max_length' (e.g. '0.75: 50, 0.875: 40'). Caps fabricated section length for given wall thickness (in : ft).")
-                r_tl[1].radio("Rule applies to", ["Thickness and heavier (>=)", "Exact thickness only (=)"],
-                              key="o_thick_len_mode", horizontal=True)
-                st.caption(
-                    "**Thickness-dependent section length limit (optional).** Press brake forming capacity drops for heavy plates. "
-                    "For example, entering `0.75: 50` guarantees that any pole section with wall thickness ≥ 0.75\" cannot exceed 50.0 ft. "
-                    "Multiple tiers can be entered (e.g. `0.625: 55, 0.75: 50, 0.875: 40`). Leave blank for unconstrained lengths.")
-                curr_rules, curr_err = _parse_thick_len(st.session_state.get("o_thick_len_rules", ""))
-                if curr_err:
-                    st.warning(f"⚠️ {curr_err}")
-                elif curr_rules:
-                    sym_ = "≥" if st.session_state.get("o_thick_len_mode") == "Thickness and heavier (>=)" else "="
-                    badges_ = "  |  ".join(f"t {sym_} {t_:g}\" → max {ml_:g} ft" for t_, ml_ in sorted(curr_rules.items()))
-                    st.info(f"🎯 **Active thickness constraints:** {badges_}")
+                has_rules = any(float(st.session_state.get(f"o_rule_t_{i}", 0.0) or 0.0) > 0 for i in range(1, 5))
+                with st.expander("⚙️ Optional: Thickness-dependent section length limits (press-brake rules)", expanded=has_rules):
+                    st.radio("Rule mode", ["Thickness and heavier (>=)", "Exact thickness only (=)"],
+                             key="o_thick_len_mode", horizontal=True,
+                             help="'Thickness and heavier (>=)' is recommended: capping 0.75\" plate also caps 0.875\" and 1.0\" unless a stricter rule is set.")
+                    st.caption(
+                        "Press-brake forming capacity drops for heavy plates. Specify the maximum fabricated "
+                        "section length allowed for specific plate thicknesses (e.g. 0.75\" shaft capped at 50 ft). "
+                        "Leave a slot at 0 to leave it inactive."
+                    )
+                    c_h = st.columns([1, 2, 2])
+                    c_h[0].markdown("**Rule**")
+                    c_h[1].markdown("**Wall Thickness (in)**")
+                    c_h[2].markdown("**Max Section Length (ft)**")
+
+                    for i in range(1, 5):
+                        c_r = st.columns([1, 2, 2])
+                        c_r[0].markdown(f"**Rule {i}**")
+                        c_r[1].number_input(f"Thickness {i}", key=f"o_rule_t_{i}", min_value=0.0, max_value=2.0,
+                                            step=0.0625, format="%.4f", label_visibility="collapsed")
+                        c_r[2].number_input(f"Length {i}", key=f"o_rule_l_{i}", min_value=0.0, max_value=100.0,
+                                            step=0.25, format="%.2f", label_visibility="collapsed")
+
+                    active_rules = {}
+                    for i in range(1, 5):
+                        ti = st.session_state.get(f"o_rule_t_{i}", 0.0)
+                        li = st.session_state.get(f"o_rule_l_{i}", 0.0)
+                        if ti and li and float(ti) > 0 and float(li) > 0:
+                            active_rules[round(float(ti), 4)] = round(float(li), 2)
+
+                    if active_rules:
+                        sym_ = "≥" if st.session_state.get("o_thick_len_mode") == "Thickness and heavier (>=)" else "="
+                        badges_ = "  |  ".join(f"t {sym_} {t_:g}\" → max {ml_:g} ft" for t_, ml_ in sorted(active_rules.items()))
+                        st.info(f"🎯 **Active thickness constraints:** {badges_}")
+                    else:
+                        st.caption("No thickness-specific length limits active. Standard length limits apply to all thicknesses.")
 
                 r2 = st.columns([1, 1, 1.4])
                 r2[0].checkbox("Fix bottom tube length", key="o_fix_bottom")
@@ -867,7 +892,14 @@ with tab6:
                 S = st.session_state
                 ov = {k: 'flange' for k in _pos(S.o_flange_at)}
                 ov.update({k: 'slip' for k in _pos(S.o_slip_at)})
-                tl_map, _ = _parse_thick_len(S.o_thick_len_rules)
+                tl_map = {}
+                for i in range(1, 5):
+                    ti = S.get(f"o_rule_t_{i}", 0.0)
+                    li = S.get(f"o_rule_l_{i}", 0.0)
+                    if ti and li and float(ti) > 0 and float(li) > 0:
+                        tl_map[round(float(ti), 4)] = round(float(li), 2)
+                if not tl_map and S.get("o_thick_len_rules"):
+                    tl_map, _ = _parse_thick_len(S.get("o_thick_len_rules"))
                 C6 = OptConstraints(
                     tip_min=S.o_tip_min, tip_max=S.o_tip_max, tip_inc=S.o_tip_inc,
                     base_min=S.o_base_min, base_max=S.o_base_max, base_inc=S.o_base_inc,
