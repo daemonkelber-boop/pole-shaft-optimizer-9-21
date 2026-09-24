@@ -900,6 +900,42 @@ with tab6:
                         tl_map[round(float(ti), 4)] = round(float(li), 2)
                 # (o_thick_len_rules was removed in favour of the structured
                 # rule_t_1..4 / rule_l_1..4 inputs — no fallback needed)
+
+                # ── Coarse tube-length grid ───────────────────────────────
+                # The default coarse_len_values (53–60 ft) suit tall poles
+                # where each tube is ~53–60 ft. For shorter poles (e.g.
+                # 110 ft) two 53 ft uppers already leave only 4 ft for the
+                # bottom tube — below min_tube — so no 3-tube layouts exist.
+                #
+                # Fix: span coarse values from just above min_tube all the
+                # way to min(len_special_max, H − min_tube). Short values
+                # enable multi-tube layouts on short poles; long values keep
+                # 2-tube layouts feasible.  The optimizer's _layouts() then
+                # combines them — e.g. (55 ft, 20 ft) upper pair on a 110 ft
+                # pole is valid: bottom = 35 ft ≥ min_tube.
+                _H6  = spec6.total_length
+                _mt6 = float(S.o_min_tube)
+                _ls6 = float(S.o_len_special_max)
+                # Hard upper bound: leave at least min_tube for the bottom tube
+                _max_c = min(_ls6, _H6 - _mt6)
+                _min_c = max(_mt6 + 2.5, 15.0)
+                if _max_c > _min_c:
+                    _span = _max_c - _min_c
+                    # ~6 steps; round step to nearest 2.5 ft
+                    _step = max(5.0, round(_span / 6 / 2.5) * 2.5)
+                    _cv = []
+                    _v = _min_c
+                    while _v <= _max_c + 1e-6:
+                        _cv.append(round(_v, 2))
+                        _v += _step
+                    # always include len_preferred and len_special_max
+                    for _extra in (float(S.o_len_preferred), _ls6):
+                        if _min_c <= _extra <= _max_c:
+                            _cv.append(_extra)
+                    _coarse6 = tuple(sorted(set(_cv)))
+                else:
+                    _coarse6 = (round(_max_c, 2),)
+
                 C6 = OptConstraints(
                     tip_min=S.o_tip_min, tip_max=S.o_tip_max, tip_inc=S.o_tip_inc,
                     base_min=S.o_base_min, base_max=S.o_base_max, base_inc=S.o_base_inc,
@@ -923,7 +959,8 @@ with tab6:
                     tie_band_pct=S.o_tie_band_pct, n_alternates=int(S.o_n_alternates),
                     shear_mode=SHEAR, lap_stiffness=LAP,
                     time_limit_s=float(S.o_time_limit_min) * 60.0,
-                    max_evaluations=int(S.o_max_evals))
+                    max_evaluations=int(S.o_max_evals),
+                    coarse_len_values=_coarse6)
 
                 run_hdr = st.empty()
                 run_hdr.subheader("Running")
