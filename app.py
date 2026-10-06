@@ -77,12 +77,24 @@ def build_spec(p):
     if not is_bp and conn:
         emb = gf(conn[0], 'embed_override') or gf(prop, 'default_embedded_length') or 0.0
     segs = []
-    for t in tubes:
+    for i, t in enumerate(tubes):
         lap = gf(t, 'lap_length') or 0.0
+        # BASELINE ONLY: reproduce the XML exactly. Where the joint above
+        # this tube is a flange and PLS-POLE steps the diameter (017: +0.50,
+        # 001: +0.38 in -- both = 2 x (t_lower - t_upper)), take the XML top
+        # diameter. Candidates do NOT use this: make_spec() keeps flange
+        # joints at constant diameter (user rule).
+        top_ov = None
+        if i > 0 and (gf(tubes[i - 1], 'lap_length') or 0.0) == 0:
+            d_up = gf(tubes[i - 1], 'tube_bot_diameter')
+            d_me = gf(t, 'tube_top_diameter')
+            if d_up is not None and d_me is not None and abs(d_me - d_up) > 0.005:
+                top_ov = d_me
         segs.append(Segment(length=gf(t, 'length'), thickness=gf(t, 'thickness'),
                             fy=gf(t, 'yield_stress') or 65.0,
                             joint_type='slip' if lap > 0 else 'flange',
-                            lap_override=lap if lap > 0 else None))
+                            lap_override=lap if lap > 0 else None,
+                            top_diameter_override=top_ov))
     return PoleSpec(label=prop.get('steel_pole_property_label', ''),
                     tip_diameter=gf(prop, 'tip_diameter'),
                     taper=gf(tubes[0], 'calculated_taper'),
@@ -729,7 +741,8 @@ with tab6:
                 min_slip_above_gl=0.0, fy=65.0,
                 strength_target=100.0, defl_target=100.0, tolerance_pct=0.0,
                 long_tube_threshold_pct=2.0, tie_band_pct=1.0,
-                n_alternates=10, log_all=False, time_limit_min=15.0, max_evals=200000)
+                n_alternates=10, log_all=False, time_limit_min=15.0, max_evals=200000,
+                bp_on=True, bp_tcap=220.0, bp_fc=3.0, bp_proj=12.0)
             for k, v in DEF.items():
                 st.session_state.setdefault(f"o_{k}", v)
             if st.button("↺ Reset all constraints to defaults"):
@@ -877,6 +890,22 @@ with tab6:
                 r[2].number_input("Evaluation cap", key="o_max_evals", min_value=500, step=1000,
                                   help="Hard stop on the number of screening analyses. Leave high and let "
                                        "the time limit govern; lower it only to force a quick run.")
+                st.markdown("**Base plate & anchor bolts (post-check, base-plate poles only)**")
+                r = st.columns(4)
+                r[0].checkbox("Size base plate + anchor bolts", key="o_bp_on",
+                              help="Shaft-only ranking. Each reported shaft gets a plate/anchor-bolt "
+                                   "layout (ASCE 48-19 App. F wedge method as PLS-POLE, 6.4.2 50% rule, "
+                                   "anchor bolts per 6.2.2-6.2.4). A shaft with no feasible layout is "
+                                   "rejected and the next one promoted.")
+                r[1].number_input("Max anchor bolt axial, T or C (kips)", key="o_bp_tcap", min_value=1.0, step=5.0,
+                                  help="Applied to tension and compression; effective limit = value x strength target.")
+                r[2].number_input("f'c for development length (ksi, 0 = not set)", key="o_bp_fc",
+                                  min_value=0.0, step=0.5,
+                                  help="ASCE 48-19 Eq. 9.3-5. Needed for anchor bolt length/weight.")
+                r[3].number_input("Anchor bolt projection (in, 0 = not set)", key="o_bp_proj",
+                                  min_value=0.0, step=1.0,
+                                  help="Length above top of concrete. Bolt length = Ld + projection. "
+                                       "Without f'c and projection, the fewest-bolt layout is chosen.")
                 st.checkbox("Log every candidate tried", key="o_log_all")
                 go_run = st.form_submit_button("▶ Run optimizer", type="primary")
 
@@ -887,6 +916,15 @@ with tab6:
                     if x:
                         out.append(int(float(x)))
                 return out
+
+            def _bp_rules(p_, S_):
+                from baseplate import BasePlateRules
+                bp_rows = [r_ for inst in p_['tables'].get('base_plate', []) for r_ in inst['rows']
+                           if 'bolt_angle' in r_]
+                start = float(bp_rows[0]['bolt_angle']['value']) if bp_rows else 0.0
+                return BasePlateRules(tension_cap=float(S_.o_bp_tcap), start_deg=start,
+                                      fc_ksi=float(S_.o_bp_fc) or None,
+                                      projection_in=float(S_.o_bp_proj) or None)
 
             if go_run:
                 S = st.session_state
@@ -960,7 +998,8 @@ with tab6:
                     shear_mode=SHEAR, lap_stiffness=LAP,
                     time_limit_s=float(S.o_time_limit_min) * 60.0,
                     max_evaluations=int(S.o_max_evals),
-                    coarse_len_values=_coarse6)
+                    coarse_len_values=_coarse6,
+                    bp_rules=_bp_rules(p6, S) if S.o_bp_on else None)
 
                 run_hdr = st.empty()
                 run_hdr.subheader("Running")
@@ -1052,6 +1091,22 @@ with tab6:
                     k[2].metric("Max strength", f"{win.strength:.2f}%")
                     k[3].metric("Max deflection", f"{win.defl:.2f}%" if win.defl is not None else "—")
                     k[4].metric("Governs", win.gov_check)
+                    if win.baseplate:
+                        bpw = win.baseplate; bb = bpw['best']
+                        st.markdown("**Base plate & anchor bolts (post-check)**")
+                        q = st.columns(6)
+                        q[0].metric("Anchor bolts", f"{bb['n']} × #18J")
+                        q[1].metric("Bolt circle / OD / hole", f"{bpw['bc']:g} / {bpw['od']:g} / {bpw['hole']:g} in")
+                        q[2].metric("Plate t", f"{bb['t']:g} in ({bb['Fy']:g} ksi)")
+                        q[3].metric("Plate usage", f"{bb['plate_usage']:.1f}%", help=f"BL {bb['bend_line']}, {bb['plate_case']}")
+                        q[4].metric("Bolt usage", f"{bb['bolt_usage']:.1f}%", help=f"T max {bb['T_max']:.1f} k, C max {bb['C_max']:.1f} k, {bb['bolt_case']}")
+                        q[5].metric("Plate + bolt weight", f"{bb['plate_wt'] + (bb['bolt_wt'] or 0):,.0f} lb",
+                                    help=None if bb['bolt_wt'] else "Bolt weight not included (f'c / projection not set)")
+                        st.caption(f"Selection basis: {bpw['basis']}. 6.4.2 override active on "
+                                   f"{bpw['n_overridden']} load cases (M_cap = {bpw['M_cap']:,.0f} ft-k).")
+                    if res.get('bp_rejected'):
+                        st.warning(f"{len(res['bp_rejected'])} lighter shaft(s) rejected: no feasible base plate / "
+                                   "anchor bolt layout within the spacing rule.")
                     if sw["acceptance"] == "within tolerance":
                         st.info(f"Accepted within the {C6.tolerance_pct:g}% tolerance (usage above the "
                                 f"{C6.strength_target:g}% target).")

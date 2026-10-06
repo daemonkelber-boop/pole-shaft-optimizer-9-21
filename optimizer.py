@@ -57,6 +57,7 @@ from geometry import (PoleSpec, Segment, w_over_t, GAUGES, SLIP_CLEARANCE_IN)
 from weight import pole_weight
 from loads import Baseline, build_load_model, first_order_forces
 from strength import evaluate_candidate, CandidateResult
+from baseplate import BasePlateRules, size_baseplate, base_reactions
 
 
 # --------------------------------------------------------------------------
@@ -133,6 +134,10 @@ class OptConstraints:
     refine_top: int = 6
     max_evaluations: int = 200000          # effectively off; time_limit_s governs
     time_limit_s: float = 900.0               # wall-clock cap for the search phases
+    # base plate post-check (base-plate poles only). None = off.
+    #: Shaft-only ranking; a shaft with no feasible plate/anchor-bolt
+    #: layout is rejected and the next-ranked shaft is promoted.
+    bp_rules: Optional[BasePlateRules] = None
 
     def strength_limit(self) -> float:
         if self.strength_target <= 0:
@@ -298,6 +303,7 @@ class Evaluated:
     gov_check: str                  # 'strength' or 'deflection'
     verified: bool = False
     result: Optional[CandidateResult] = None
+    baseplate: Optional[dict] = None
 
 
 class Optimizer:
@@ -856,11 +862,32 @@ class Optimizer:
             groups[g].append(e)
         reps = [groups[g][0] for g in order]
         variants = {id(groups[g][0]): len(groups[g]) - 1 for g in order}
+        bp_rejected = []
+        if C.bp_rules is not None and self.emb == 0:
+            ok = []
+            for e in reps:
+                e.baseplate = self.baseplate_check(e)
+                (ok if e.baseplate['best'] is not None else bp_rejected).append(e)
+                if len(ok) > C.n_alternates:
+                    break
+            reps = ok
+            common['bp_rejected'] = bp_rejected
+            if not reps:
+                return dict(winner=None, alternates=[], kept=kept, **common)
         win = reps[0]
         alts = reps[1:1 + C.n_alternates]
         return dict(winner=win, winner_variants=variants[id(win)],
                     alternates=[(a, self.reason(a, win, band), variants[id(a)]) for a in alts],
                     kept=kept, wmin=wmin, band=band, **common)
+
+    def baseplate_check(self, e: Evaluated) -> dict:
+        """Size plate + anchor bolts for a fully verified shaft (post-check)."""
+        import dataclasses
+        R = dataclasses.replace(self.C.bp_rules, target=self.C.strength_target)
+        bot = e.spec.segments[-1]
+        return size_baseplate(e.spec.base_diameter, bot.thickness, bot.fy,
+                              base_reactions(e.result.cases), R,
+                              bend_radius_factor=self.C.bend_radius_factor)
 
     def baseline_info(self) -> dict:
         b = self.baseline_result
@@ -916,6 +943,16 @@ def summarize(e: Evaluated, C: OptConstraints) -> dict:
                                                (e.defl or 0) > C.defl_target + 1e-9) else "at/below target"),
         "long tube": "yes" if length_class(e.spec, C)['n_special'] else "no",
     }
+    bp = e.baseplate.get('best') if e.baseplate else None
+    if bp:
+        res.update({"bolt circle (in)": e.baseplate['bc'], "plate OD (in)": e.baseplate['od'],
+                    "center hole (in)": e.baseplate['hole'], "anchor bolts": bp['n'],
+                    "plate t (in)": bp['t'], "plate Fy (ksi)": bp['Fy'],
+                    "plate usage %": round(bp['plate_usage'], 2),
+                    "bolt usage %": round(bp['bolt_usage'], 2),
+                    "max bolt tension (k)": round(bp['T_max'], 1),
+                    "plate weight (lb)": round(bp['plate_wt']),
+                    "anchor bolt weight (lb)": round(bp['bolt_wt']) if bp['bolt_wt'] else None})
     if C.max_len_by_thick:
         sym = "≥" if C.thick_len_mode == 'gte' else "="
         res["t-length limits"] = ", ".join(f"t {sym} {tk:g}\" ≤ {ml:g} ft" for tk, ml in sorted(C.max_len_by_thick.items()))
