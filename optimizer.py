@@ -356,8 +356,34 @@ class Optimizer:
         self.trunc_reason = ''
         self.lb_remaining = float('inf')
         self.baseline_spec = baseline_spec
+        # Base plate feasibility as a SEARCH constraint (base-plate poles).
+        # Demand = baseline base reactions (all load cases); feasibility is
+        # cached per (base AF, bottom wall). The exact check with each
+        # design's own reactions is repeated in _rank (post-check).
+        self.bp_on = C.bp_rules is not None and self.emb == 0
+        self._bp_cache: Dict[tuple, bool] = {}
+        if self.bp_on:
+            import dataclasses
+            self._bp_R = dataclasses.replace(C.bp_rules, target=C.strength_target)
+            self._bp_reac = base_reactions(b.cases)
 
     # ---------------- helpers ----------------
+    def bp_feasible(self, D_af: float, t: float) -> bool:
+        """True if a plate / anchor bolt layout exists for this base AF and
+        bottom wall (rule bolt circle, 2.67d spacing, anchor bolt checks,
+        6.4.2), using the baseline base reactions."""
+        if not self.bp_on:
+            return True
+        key = (round(D_af, 3), round(t, 4))
+        if key not in self._bp_cache:
+            try:
+                out = size_baseplate(D_af, t, self.C.fy, self._bp_reac, self._bp_R,
+                                     bend_radius_factor=self.C.bend_radius_factor)
+                self._bp_cache[key] = out['best'] is not None
+            except ValueError:
+                self._bp_cache[key] = False
+        return self._bp_cache[key]
+
     def _layouts(self, values) -> List[Tuple[float, ...]]:
         """Upper-tube length sets. Tubes longer than the normal max are only
         generated at a segment count where no all-standard layout is
@@ -494,6 +520,13 @@ class Optimizer:
         if t.max() > G[-1] + 1e-9:
             return None, ()
         idx = tuple(next(i for i, g in enumerate(G) if g >= tk - 1e-9) for tk in t)
+        if self.bp_on:
+            kb = next((i for i in range(idx[-1], len(G)) if self.bp_feasible(d.base, G[i])), None)
+            if kb is None:
+                return None, ()          # no bottom wall makes the base plate work
+            if kb > idx[-1]:
+                idx = idx[:-1] + (kb,)
+                t = t.copy(); t[-1] = G[kb]
         if C.max_len_by_thick:
             for k, tb in enumerate(lay):
                 cap = C.max_length_for_thickness(G[idx[k]])
@@ -512,6 +545,10 @@ class Optimizer:
             self._log(d, None, why)
             return None, why
         C = self.C
+        if self.bp_on and not self.bp_feasible(spec.base_diameter, spec.segments[-1].thickness):
+            self.cache[key] = None
+            self._log(d, None, 'base plate infeasible')
+            return None, 'baseplate'
         self.n_evals += 1
         r = evaluate_candidate(spec, self.base,
                                cases=None if full else self.screen_cases,
@@ -596,6 +633,8 @@ class Optimizer:
                     return None
             elif why.startswith('tube') and 'w/t' in why:
                 k = int(why.split()[1]) - 1
+            elif why == 'baseplate':
+                k = len(ts) - 1
             else:
                 return None                     # geometry failure (taper, lengths)
             if ts[k] >= len(G) - 1:
@@ -945,14 +984,9 @@ def summarize(e: Evaluated, C: OptConstraints) -> dict:
     }
     bp = e.baseplate.get('best') if e.baseplate else None
     if bp:
-        res.update({"bolt circle (in)": e.baseplate['bc'], "plate OD (in)": e.baseplate['od'],
-                    "center hole (in)": e.baseplate['hole'], "anchor bolts": bp['n'],
-                    "plate t (in)": bp['t'], "plate Fy (ksi)": bp['Fy'],
-                    "plate usage %": round(bp['plate_usage'], 2),
-                    "bolt usage %": round(bp['bolt_usage'], 2),
-                    "max bolt tension (k)": round(bp['T_max'], 1),
-                    "plate weight (lb)": round(bp['plate_wt']),
-                    "anchor bolt weight (lb)": round(bp['bolt_wt']) if bp['bolt_wt'] else None})
+        # Feasibility screen only -- full option list is in the Base Plate tab.
+        res["lightest base plate + bolts (lb)"] = round(bp['total_wt'] if bp['total_wt'] is not None
+                                                       else bp['plate_wt'])
     if C.max_len_by_thick:
         sym = "≥" if C.thick_len_mode == 'gte' else "="
         res["t-length limits"] = ", ".join(f"t {sym} {tk:g}\" ≤ {ml:g} ft" for tk, ml in sorted(C.max_len_by_thick.items()))

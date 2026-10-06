@@ -118,10 +118,27 @@ def gov_index(cases, name):
 
 tmp_path = save_xml(uploaded.getvalue()) if uploaded else None
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📂 1 · XML Parser", "📐 2 · Geometry & Weight", "💨 3 · Loads",
     "🔩 4 · Strength Check", "📏 5 · Deflection", "⚖️ 6 · Optimizer",
+    "🧱 7 · Base Plate",
 ])
+
+# Base plate / anchor bolt settings: edited in Tab 7, also used by the
+# Tab 6 feasibility screen.
+for _k, _v in dict(bp_tcap=220.0, bp_fc=3.0, bp_proj=12.0).items():
+    st.session_state.setdefault(_k, _v)
+
+def bp_rules_from_state(p_, target=100.0):
+    """BasePlateRules from the Tab 7 settings; bolt orientation from the XML."""
+    from baseplate import BasePlateRules
+    rows_ = [r_ for inst in p_['tables'].get('base_plate', []) for r_ in inst['rows']
+             if 'bolt_angle' in r_]
+    start = float(rows_[0]['bolt_angle']['value']) if rows_ else 0.0
+    S_ = st.session_state
+    return BasePlateRules(tension_cap=float(S_.bp_tcap), start_deg=start,
+                          fc_ksi=float(S_.bp_fc) or None,
+                          projection_in=float(S_.bp_proj) or None, target=target)
 
 # ── TAB 1: XML PARSER ──────────────────────────────────────────────────────
 with tab1:
@@ -742,7 +759,7 @@ with tab6:
                 strength_target=100.0, defl_target=100.0, tolerance_pct=0.0,
                 long_tube_threshold_pct=2.0, tie_band_pct=1.0,
                 n_alternates=10, log_all=False, time_limit_min=15.0, max_evals=200000,
-                bp_on=True, bp_tcap=220.0, bp_fc=3.0, bp_proj=12.0)
+                bp_on=True)
             for k, v in DEF.items():
                 st.session_state.setdefault(f"o_{k}", v)
             if st.button("↺ Reset all constraints to defaults"):
@@ -890,22 +907,15 @@ with tab6:
                 r[2].number_input("Evaluation cap", key="o_max_evals", min_value=500, step=1000,
                                   help="Hard stop on the number of screening analyses. Leave high and let "
                                        "the time limit govern; lower it only to force a quick run.")
-                st.markdown("**Base plate & anchor bolts (post-check, base-plate poles only)**")
-                r = st.columns(4)
-                r[0].checkbox("Size base plate + anchor bolts", key="o_bp_on",
-                              help="Shaft-only ranking. Each reported shaft gets a plate/anchor-bolt "
-                                   "layout (ASCE 48-19 App. F wedge method as PLS-POLE, 6.4.2 50% rule, "
-                                   "anchor bolts per 6.2.2-6.2.4). A shaft with no feasible layout is "
-                                   "rejected and the next one promoted.")
-                r[1].number_input("Max anchor bolt axial, T or C (kips)", key="o_bp_tcap", min_value=1.0, step=5.0,
-                                  help="Applied to tension and compression; effective limit = value x strength target.")
-                r[2].number_input("f'c for development length (ksi, 0 = not set)", key="o_bp_fc",
-                                  min_value=0.0, step=0.5,
-                                  help="ASCE 48-19 Eq. 9.3-5. Needed for anchor bolt length/weight.")
-                r[3].number_input("Anchor bolt projection (in, 0 = not set)", key="o_bp_proj",
-                                  min_value=0.0, step=1.0,
-                                  help="Length above top of concrete. Bolt length = Ld + projection. "
-                                       "Without f'c and projection, the fewest-bolt layout is chosen.")
+                st.checkbox("Require a feasible base plate / anchor bolt layout "
+                            "(base-plate poles only)", key="o_bp_on",
+                            help="Constraint inside the search; ranking stays shaft-weight based. "
+                                 "A shaft is only considered if its base across-flats and bottom wall "
+                                 "allow a layout that passes: rule bolt circle, #18J bolts at 2.67d "
+                                 "spacing, anchor bolt checks, 6.4.2. The search thickens the bottom "
+                                 "tube or moves to a larger base when needed. Uses the Tab 7 settings and "
+                                 "the baseline base reactions; every reported design is then re-checked "
+                                 "with its own reactions. Compare plate options in Tab 7.")
                 st.checkbox("Log every candidate tried", key="o_log_all")
                 go_run = st.form_submit_button("▶ Run optimizer", type="primary")
 
@@ -918,13 +928,7 @@ with tab6:
                 return out
 
             def _bp_rules(p_, S_):
-                from baseplate import BasePlateRules
-                bp_rows = [r_ for inst in p_['tables'].get('base_plate', []) for r_ in inst['rows']
-                           if 'bolt_angle' in r_]
-                start = float(bp_rows[0]['bolt_angle']['value']) if bp_rows else 0.0
-                return BasePlateRules(tension_cap=float(S_.o_bp_tcap), start_deg=start,
-                                      fc_ksi=float(S_.o_bp_fc) or None,
-                                      projection_in=float(S_.o_bp_proj) or None)
+                return bp_rules_from_state(p_)
 
             if go_run:
                 S = st.session_state
@@ -1035,6 +1039,7 @@ with tab6:
                 bar.empty(); live.empty(); run_hdr.empty()
                 st.session_state["opt_result"] = dict(res=res, C=C6, log=opt_real.log, file=tmp_path)
                 st.session_state.pop("opt_pick", None)
+                st.session_state.pop("opt_pickable", None)
 
             R = st.session_state.get("opt_result")
             if R and R["file"] == tmp_path:
@@ -1078,7 +1083,12 @@ with tab6:
                              "Designs below were accepted on strength alone and may exceed the deflection "
                              "limits in the XML. Set the target to 100 to enforce them.")
                 win = res["winner"]
-                if win is None:
+                if win is None and res.get("bp_rejected"):
+                    st.error(f"All {len(res['bp_rejected'])} verified shaft designs were rejected by the base "
+                             "plate screen: their base is too small to fit enough #18J anchor bolts on the rule "
+                             "bolt circle. Raise the base diameter range, or untick the base plate screen, "
+                             "re-run, and review the plate options in Tab 7.")
+                elif win is None:
                     st.error("No design satisfied all constraints and load cases. "
                              "Widen the diameter / thickness / taper ranges and re-run.")
                 else:
@@ -1092,18 +1102,11 @@ with tab6:
                     k[3].metric("Max deflection", f"{win.defl:.2f}%" if win.defl is not None else "—")
                     k[4].metric("Governs", win.gov_check)
                     if win.baseplate:
-                        bpw = win.baseplate; bb = bpw['best']
-                        st.markdown("**Base plate & anchor bolts (post-check)**")
-                        q = st.columns(6)
-                        q[0].metric("Anchor bolts", f"{bb['n']} × #18J")
-                        q[1].metric("Bolt circle / OD / hole", f"{bpw['bc']:g} / {bpw['od']:g} / {bpw['hole']:g} in")
-                        q[2].metric("Plate t", f"{bb['t']:g} in ({bb['Fy']:g} ksi)")
-                        q[3].metric("Plate usage", f"{bb['plate_usage']:.1f}%", help=f"BL {bb['bend_line']}, {bb['plate_case']}")
-                        q[4].metric("Bolt usage", f"{bb['bolt_usage']:.1f}%", help=f"T max {bb['T_max']:.1f} k, C max {bb['C_max']:.1f} k, {bb['bolt_case']}")
-                        q[5].metric("Plate + bolt weight", f"{bb['plate_wt'] + (bb['bolt_wt'] or 0):,.0f} lb",
-                                    help=None if bb['bolt_wt'] else "Bolt weight not included (f'c / projection not set)")
-                        st.caption(f"Selection basis: {bpw['basis']}. 6.4.2 override active on "
-                                   f"{bpw['n_overridden']} load cases (M_cap = {bpw['M_cap']:,.0f} ft-k).")
+                        bb = win.baseplate['best']
+                        st.info(f"Base plate feasible: lightest layout {bb['n']} × #18J, {bb['t']:g} in plate, "
+                                f"{(bb['total_wt'] or bb['plate_wt']):,.0f} lb plate + bolts. "
+                                "**Go to Tab 7 · Base Plate** to compare all plate / anchor bolt options "
+                                "for this or any other design.")
                     if res.get('bp_rejected'):
                         st.warning(f"{len(res['bp_rejected'])} lighter shaft(s) rejected: no feasible base plate / "
                                    "anchor bolt layout within the spacing rule.")
@@ -1162,6 +1165,8 @@ with tab6:
                     for e in res.get("dropped", []):
                         labels[id(e)] = f"Excluded (long-tube rule) · {e.weight:,.0f} lb"
                     pickable += list(res.get("dropped", []))
+                    st.session_state["opt_pickable"] = dict(
+                        file=tmp_path, items=[(labels[id(e_)], e_) for e_ in pickable])
                     gu = lambda e: max(e.strength, e.defl or 0.0)
 
                     st.subheader("Design map — every fully verified design")
@@ -1333,5 +1338,201 @@ with tab6:
                 if R["log"]:
                     with st.expander(f"Every candidate tried ({len(R['log'])})"):
                         st.dataframe(pd.DataFrame(R["log"]), width="stretch", hide_index=True)
+        except Exception as e:
+            show_error(e)
+
+
+# ── TAB 7: BASE PLATE & ANCHOR BOLTS ───────────────────────────────────────
+with tab7:
+    st.header("Base Plate & Anchor Bolt Options")
+    with st.expander("ℹ️ How to use this tab", expanded=True):
+        st.markdown("""
+1. **Upload** a base-plate pole XML in the sidebar. Embedded poles have no base plate.
+2. **Optional:** run the optimizer in **Tab 6**. Without a run, only the baseline XML design is available here.
+3. **Pick the pole design** below. It defaults to the design selected in Tab 6
+   (the recommended design unless you clicked another one in the design map or detail check).
+   You can choose any ranked, other verified, or baseline design.
+4. **Check the anchor bolt settings.** The usage target follows Tab 6 unless you change it.
+5. **Compare the options.** Each row is one bolt count (multiples of 4, up to the 2.67d spacing limit)
+   with the thinnest plate (¼ in steps) that passes. Plate weight, anchor bolt weight and their sum
+   are listed; ★ marks the lightest.
+6. **Select an option** to see its workbook rule check, per-load-case results, and to export it.
+
+**Fixed by your rules (not options):** bolt circle, plate OD and center hole follow from the base
+across-flats and the bottom-tube wall; anchor bolts are always A615 Gr 75 #18J; plates are round.
+Re-verify the chosen layout in PLS-POLE.
+""")
+    if not tmp_path:
+        st.info("Upload a PLS-POLE XML file in the sidebar to begin.")
+    else:
+        try:
+            from baseplate import (size_baseplate, base_reactions, option_detail,
+                                   workbook_rules_check, check_existing, bolt_circle)
+            from pls_pole_xml_parser import get_single_table as _gst7, get_field as _gf7
+            p7 = load_parsed(tmp_path)
+            spec7 = build_spec(p7)
+            S = st.session_state
+            if spec7.embedment > 0:
+                st.info("This is an embedded pole — no base plate to design.")
+            else:
+                # ---- 1. pole design
+                st.subheader("1 · Pole design")
+                items = []
+                pk = S.get("opt_pickable")
+                if pk and pk.get("file") == tmp_path:
+                    items = list(pk["items"])
+                BASE_LBL = "Baseline (XML design)"
+                items.append((BASE_LBL, None))
+                opts7 = [l_ for l_, _ in items]
+                o6 = S.get("opt_pick")
+                if o6 in opts7 and S.get("bp_synced") != o6:
+                    S["bp_pick"] = o6
+                    S["bp_synced"] = o6
+                if S.get("bp_pick") not in opts7:
+                    S["bp_pick"] = opts7[0]
+                if len(items) == 1:
+                    st.caption("No optimizer result for this file yet — run Tab 6 to size base plates for "
+                               "optimized designs.")
+                pick7 = st.selectbox("Pole design to size the base plate for", opts7, key="bp_pick")
+                e7 = dict(items)[pick7]
+                if e7 is None:
+                    spec_sel = spec7
+                    with st.spinner("Analysing baseline…"):
+                        cr7 = run_candidate(tmp_path, BR, SHEAR, LAP)
+                    shaft_wt = None
+                    from weight import pole_weight
+                    shaft_wt = pole_weight(spec7)['total_weight']
+                else:
+                    spec_sel, cr7, shaft_wt = e7.spec, e7.result, e7.weight
+                if cr7 is None:
+                    raise ValueError("This design has no full all-case analysis stored; pick a verified design.")
+                bot = spec_sel.segments[-1]
+                D_af = spec_sel.base_diameter
+
+                # ---- 2. settings
+                st.subheader("2 · Anchor bolt settings")
+                R6 = S.get("opt_result")
+                tgt_default = (R6["C"].strength_target if R6 and R6.get("file") == tmp_path else 100.0)
+                S.setdefault("bp_target", tgt_default)
+                c = st.columns(4)
+                c[0].selectbox("Usage target (%)", [100.0, 95.0, 90.0, 85.0], key="bp_target",
+                               help="Applies to plate bending and all anchor bolt checks, including the axial cap.")
+                c[1].number_input("Max anchor bolt axial, T or C (kips)", key="bp_tcap", min_value=1.0, step=5.0,
+                                  help="Effective limit = value × usage target.")
+                c[2].number_input("f'c (ksi)", key="bp_fc", min_value=0.0, step=0.5,
+                                  help="Development length, ASCE 48-19 Eq. 9.3-5. 0 = bolt weight not computed.")
+                c[3].number_input("Bolt projection (in)", key="bp_proj", min_value=0.0, step=1.0,
+                                  help="Above top of concrete. Bolt length = development length + projection.")
+                RR = bp_rules_from_state(p7, target=float(S.bp_target))
+
+                out = size_baseplate(D_af, bot.thickness, bot.fy, base_reactions(cr7.cases), RR,
+                                     bend_radius_factor=BR)
+                k = st.columns(5)
+                k[0].metric("Base AF / wall", f"{D_af:.2f} in / {bot.thickness:g} in")
+                k[1].metric("Bolt circle (rule)", f"{out['bc']:g} in")
+                k[2].metric("Plate OD / hole (rule)", f"{out['od']:g} / {out['hole']:g} in")
+                k[3].metric("Max bolts (2.67d)", f"{out['n_max']}")
+                k[4].metric("50% M_cap (6.4.2)", f"{0.5 * out['M_cap']:,.0f} ft-k",
+                            help=f"Override active on {out['n_overridden']} of {len(cr7.cases)} load cases.")
+
+                # ---- 3. options
+                st.subheader("3 · Base plate options")
+                rows = out["table"]
+                if not rows:
+                    st.error("No feasible layout: even the maximum bolt count fails the anchor bolt checks. "
+                             "This shaft needs a larger base diameter or thicker bottom tube.")
+                else:
+                    has_bw = rows[0]["total_wt"] is not None
+                    keyf = (lambda r_: r_["total_wt"]) if has_bw else (lambda r_: r_["plate_wt"])
+                    rows = sorted(rows, key=keyf)
+                    w0 = keyf(rows[0])
+                    gov = lambda r_: max((("tension", r_["u_tension"]), ("compression", r_["u_compression"]),
+                                          ("shear", r_["u_shear"]), ("axial cap", r_["u_cap"])),
+                                         key=lambda z: z[1])[0]
+                    tbl = []
+                    for i, r_ in enumerate(rows):
+                        tbl.append({
+                            "": "★" if i == 0 else "",
+                            "anchor bolts": r_["n"], "spacing (in)": round(r_["spacing"], 3),
+                            "plate t (in)": r_["t"], "plate Fy (ksi)": r_["Fy"],
+                            "plate usage %": round(r_["plate_usage"], 1), "bend line": r_["bend_line"],
+                            "bolt usage %": round(r_["bolt_usage"], 1), "bolt governs": gov(r_),
+                            "max T / C (k)": f"{r_['T_max']:.0f} / {r_['C_max']:.0f}",
+                            "bolt length (in)": round(r_["bolt_len"], 1) if r_["bolt_len"] else None,
+                            "plate wt (lb)": round(r_["plate_wt"]),
+                            "anchor bolt wt (lb)": round(r_["bolt_wt"]) if r_["bolt_wt"] else None,
+                            "plate + bolts (lb)": round(keyf(r_)),
+                            "Δ vs ★ (lb)": round(keyf(r_) - w0),
+                            "shaft + plate + bolts (lb)": round(shaft_wt + keyf(r_)),
+                        })
+                    st.dataframe(pd.DataFrame(tbl), width="stretch", hide_index=True)
+                    if not has_bw:
+                        st.warning("f'c or projection is 0, so anchor bolt weight is not included; "
+                                   "options are ranked on plate weight only.")
+                    if out["rejected"]:
+                        st.caption("Bolt counts that fail the anchor bolt checks: " +
+                                   ", ".join(f"{n_} ({why.split(' ')[-1]})" for n_, why in out["rejected"]) + ".")
+                    st.caption("Plate thickness is the thinnest ¼ in step passing on all 12 bend lines and all "
+                               "load cases (Fy 50 ksi ≤ 4 in, 42 ksi > 4 in). Bolt weight = gross area × "
+                               "(development length + projection); nuts and washers excluded.")
+
+                    # ---- 4. selected option
+                    st.subheader("4 · Selected option")
+                    lbl = lambda r_: (f"{r_['n']} bolts · {r_['t']:g} in plate · {keyf(r_):,.0f} lb"
+                                      + ("  ★ lightest" if r_ is rows[0] else ""))
+                    labels7 = [lbl(r_) for r_ in rows]
+                    if S.get("bp_option") not in labels7:
+                        S["bp_option"] = labels7[0]
+                    sel = st.selectbox("Option", labels7, key="bp_option")
+                    ro = rows[[lbl(r_) for r_ in rows].index(sel)]
+                    m = st.columns(5)
+                    m[0].metric("Layout", f"{ro['n']} × #18J on {out['bc']:g} in")
+                    m[1].metric("Plate", f"Ø{out['od']:g} × {ro['t']:g} in", f"hole Ø{out['hole']:g} in",
+                                delta_color="off")
+                    m[2].metric("Plate usage", f"{ro['plate_usage']:.1f}%", f"BL {ro['bend_line']}",
+                                delta_color="off")
+                    m[3].metric("Bolt usage", f"{ro['bolt_usage']:.1f}%", gov(ro), delta_color="off")
+                    m[4].metric("Plate + bolts", f"{keyf(ro):,.0f} lb",
+                                f"{ro['plate_wt']:,.0f} + {(ro['bolt_wt'] or 0):,.0f}", delta_color="off")
+                    st.markdown("**Workbook rule check**")
+                    st.dataframe(pd.DataFrame(workbook_rules_check(D_af, bot.thickness, ro["n"], out["bc"],
+                                                                   out["od"], out["hole"], RR)),
+                                 width="stretch", hide_index=True)
+                    det = option_detail(D_af, bot.thickness, bot.fy, base_reactions(cr7.cases), RR,
+                                        ro["n"], ro["t"], bend_radius_factor=BR)
+                    with st.expander("Per-load-case results"):
+                        st.dataframe(pd.DataFrame(det), width="stretch", hide_index=True)
+                    exp = pd.DataFrame([{
+                        "pole design": pick7, "base AF (in)": round(D_af, 3), "bottom wall (in)": bot.thickness,
+                        "anchor bolts": ro["n"], "bolt": "A615 Gr 75 #18J", "bolt circle (in)": out["bc"],
+                        "plate OD (in)": out["od"], "center hole (in)": out["hole"], "plate t (in)": ro["t"],
+                        "plate Fy (ksi)": ro["Fy"], "plate usage %": round(ro["plate_usage"], 2),
+                        "bolt usage %": round(ro["bolt_usage"], 2),
+                        "bolt length (in)": round(ro["bolt_len"], 1) if ro["bolt_len"] else None,
+                        "plate wt (lb)": round(ro["plate_wt"]),
+                        "anchor bolt wt (lb)": round(ro["bolt_wt"]) if ro["bolt_wt"] else None,
+                        "usage target %": float(S.bp_target), "axial cap (k)": float(S.bp_tcap),
+                        "f'c (ksi)": float(S.bp_fc), "projection (in)": float(S.bp_proj)}])
+                    st.download_button("Selected option (CSV)", exp.to_csv(index=False),
+                                       file_name=f"base_plate_{ro['n']}b_{ro['t']:g}in.csv")
+
+                # ---- baseline: compare with the PLS-POLE design
+                if e7 is None:
+                    bp7 = _gst7(p7, 'base_plate_properties')
+                    if bp7:
+                        b0 = bp7[0]
+                        n0, t0, bc0 = int(_gf7(b0, 'num_of_bolts')), _gf7(b0, 'plate_thick'), _gf7(b0, 'bolt_pattern_diam')
+                        ex = check_existing(D_af, bot.thickness, bot.fy, base_reactions(cr7.cases), RR,
+                                            n=n0, t=t0, bc=bc0, bend_radius_factor=BR)
+                        st.subheader("Baseline XML base plate, checked here")
+                        st.dataframe(pd.DataFrame([{
+                            "anchor bolts": n0, "bolt circle (in)": bc0, "plate t (in)": t0,
+                            "plate usage % (here)": round(ex["plate_usage"], 2), "bend line": ex["bend_line"],
+                            "governing case": ex["plate_case"], "bolt usage %": round(ex["bolt"]["usage"], 2),
+                            "max T / C (k)": f"{ex['bolt']['T_max']:.1f} / {ex['bolt']['C_max']:.1f}",
+                            "plate wt, PLS (lb)": round(_gf7(b0, 'plate_weight') or 0)}]),
+                            width="stretch", hide_index=True)
+                        st.caption("Plate usage here uses this tool's base reactions; compare with PLS-POLE's "
+                                   "'Summary of Base Plate Usages' to confirm the match.")
         except Exception as e:
             show_error(e)

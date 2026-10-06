@@ -348,3 +348,41 @@ def workbook_rules_check(D_af: float, t_pole: float, n: int, bc: float, od: floa
         dict(check='Plate diameter', calculated=od_c, required=od, status=eq(od_c, od)),
         dict(check='Hole diameter', calculated=hole_c, required=hole, status=eq(hole_c, hole)),
     ]
+
+
+def option_detail(D_af: float, t_pole: float, Fy_pole: float, reactions: dict,
+                  R: BasePlateRules, n: int, t: float,
+                  bend_radius_factor: float = 4.5) -> List[dict]:
+    """Per-load-case breakdown of one plate/bolt option (rule dBC).
+    Moments shown are the values used in the check (after the 6.4.2
+    override); P is the shaft axial at the base (plate weight excluded)."""
+    bc = bolt_circle(D_af, t_pole, R)
+    Mcap = base_moment_capacity(D_af, t_pole, Fy_pole, bend_radius_factor)
+    Mx0, My0 = np.asarray(reactions['Mx'], float), np.asarray(reactions['My'], float)
+    Mx, My, low = (half_capacity_override(Mx0, My0, Mcap) if R.apply_half_capacity
+                   else (Mx0, My0, np.zeros(len(Mx0), bool)))
+    usage, Msum, BL, b = plate_check(n, bc, D_af, t, reactions['P'], Mx, My, R)
+    Ft, Fv = 0.75 * R.bolt_Fu, 0.35 * R.bolt_Fu
+    out = []
+    for i, name in enumerate(reactions['names']):
+        k = int(np.argmax(usage[i]))
+        T = max(-BL[i].min(), 0.0); C = max(BL[i].max(), 0.0)
+        Vb = (reactions['V'][i] + abs(reactions['T'][i]) * 12.0 / (bc / 2.0)) / n
+        fv = Vb / R.Ag
+        red = math.sqrt(max(1.0 - (fv / Fv) ** 2, 0.0))
+        u_ax = max(T, C) / R.As / (Ft * red) * 100 if red > 0 else float('inf')
+        u_cap = max(T, C) / R.tension_cap * 100
+        out.append({
+            "load case": name,
+            "P base (k)": round(float(reactions['P'][i]), 1),
+            "|M| actual (ft-k)": round(float(math.hypot(Mx0[i], My0[i])), 0),
+            "|M| used (ft-k)": round(float(math.hypot(Mx[i], My[i])), 0),
+            "6.4.2 override": "yes" if low[i] else "",
+            "plate usage %": round(float(usage[i, k]), 2),
+            "bend line": k + 1,
+            "max bolt T (k)": round(T, 1), "max bolt C (k)": round(C, 1),
+            "bolt shear (k)": round(Vb, 2),
+            "bolt stress usage %": round(u_ax, 2),
+            "bolt cap usage %": round(u_cap, 2),
+        })
+    return out
