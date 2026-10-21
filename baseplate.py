@@ -386,3 +386,102 @@ def option_detail(D_af: float, t_pole: float, Fy_pole: float, reactions: dict,
             "bolt cap usage %": round(u_cap, 2),
         })
     return out
+
+
+# --------------------------------------------------------------------------
+# PLS-POLE Base Plate dialog export (display only -- nothing here feeds
+# the checks above)
+# --------------------------------------------------------------------------
+
+def pls_bolt_angles(n_bolts: int, orientation: str = "on_axis") -> List[float]:
+    """Bolt angles for ONE quadrant (0..90 deg) in the format PLS-POLE's
+    Base Plate dialog expects: it takes one quadrant only, assumes the
+    pattern is doubly symmetric, and mirrors the angles into all 4
+    quadrants.
+
+    "on_axis"  -- a bolt sits on each axis: n/4 + 1 angles, 0..90 incl.
+    "straddle" -- bolts offset half a spacing from the axes: n/4 angles,
+                  s/2 .. 90 - s/2, where s = 360 / n_bolts.
+    """
+    if n_bolts % 4 != 0:
+        raise ValueError(f"n_bolts must be a multiple of 4, got {n_bolts}")
+    s = 360.0 / n_bolts
+    if orientation == "on_axis":
+        angs = [round(k * s, 4) for k in range(n_bolts // 4 + 1)]
+        angs[0] = 0.0            # exact, no 89.9999-style residue
+        angs[-1] = 90.0
+        return angs
+    if orientation == "straddle":
+        return [round(s / 2.0 + k * s, 4) for k in range(n_bolts // 4)]
+    raise ValueError(f"unknown orientation {orientation!r} "
+                     "(use 'on_axis' or 'straddle')")
+
+
+def fmt_pls_value(x) -> str:
+    """A number as typed into PLS-POLE: no trailing zeros
+    (122.5 not 122.500, 5 not 5.00), at most 4 decimal places."""
+    v = round(float(x), 4)
+    if v == int(v):
+        return str(int(v))
+    return f"{v:.4f}".rstrip("0").rstrip(".")
+
+
+def pls_angles_text(angles: Sequence[float]) -> str:
+    """Angle column only, one value per line, no trailing newline --
+    paste into the PLS 'Bolt Angle (deg)' column starting at row 1."""
+    return "\n".join(fmt_pls_value(a) for a in angles)
+
+
+def pls_angle_rows_text(angles: Sequence[float]) -> str:
+    """Full grid rows '0<TAB>0<TAB>angle' (X and Y stay 0 when angles
+    are used) -- paste with the row 1 / Bolt X Coord. cell selected."""
+    return "\n".join(f"0\t0\t{fmt_pls_value(a)}" for a in angles)
+
+
+def _xml_num(row: dict, key: str) -> Optional[float]:
+    """Numeric value from a parsed XML row ({'value':..} dict or plain
+    string); None when the field is missing or blank."""
+    v = row.get(key)
+    if isinstance(v, dict):
+        v = v.get('value')
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def detect_pls_orientation(p: dict) -> str:
+    """Bolt-pattern orientation from the parsed XML 'Base Plate' table:
+    'on_axis' when a bolt sits at 0 deg, 'straddle' when the smallest
+    bolt angle is about half the pattern spacing. Angles come from
+    bolt_angle, or from atan2(bolt_y_coord, bolt_x_coord) when only
+    coordinates are given. No usable data -> 'on_axis'."""
+    angles = []
+    for inst in p.get('tables', {}).get('base_plate', []):
+        for r in inst.get('rows', []):
+            a = _xml_num(r, 'bolt_angle')
+            if a is None:
+                x, y = _xml_num(r, 'bolt_x_coord'), _xml_num(r, 'bolt_y_coord')
+                if x is not None and y is not None and (x or y):
+                    a = math.degrees(math.atan2(y, x)) % 360.0
+            if a is not None:
+                angles.append(a)
+    if not angles:
+        return "on_axis"
+    amin = min(angles)
+    if amin <= 0.01:
+        return "on_axis"
+    n_xml = None
+    for inst in p.get('tables', {}).get('base_plate_properties', []):
+        for r in inst.get('rows', []):
+            n_xml = _xml_num(r, 'num_of_bolts') or n_xml
+    spacing = 360.0 / n_xml if n_xml else None
+    if spacing is None:
+        uniq = sorted(set(round(a, 6) for a in angles))
+        diffs = [b - a for a, b in zip(uniq, uniq[1:]) if b - a > 0.01]
+        spacing = min(diffs) if diffs else None
+    if spacing and abs(amin - spacing / 2.0) < amin:
+        return "straddle"
+    return "on_axis"

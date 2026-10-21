@@ -1367,7 +1367,9 @@ Re-verify the chosen layout in PLS-POLE.
     else:
         try:
             from baseplate import (size_baseplate, base_reactions, option_detail,
-                                   workbook_rules_check, check_existing, bolt_circle)
+                                   workbook_rules_check, check_existing, bolt_circle,
+                                   pls_bolt_angles, detect_pls_orientation, fmt_pls_value,
+                                   pls_angles_text, pls_angle_rows_text, RHO_PCF)
             from pls_pole_xml_parser import get_single_table as _gst7, get_field as _gf7
             p7 = load_parsed(tmp_path)
             spec7 = build_spec(p7)
@@ -1494,6 +1496,62 @@ Re-verify the chosen layout in PLS-POLE.
                     m[3].metric("Bolt usage", f"{ro['bolt_usage']:.1f}%", gov(ro), delta_color="off")
                     m[4].metric("Plate + bolts", f"{keyf(ro):,.0f} lb",
                                 f"{ro['plate_wt']:,.0f} + {(ro['bolt_wt'] or 0):,.0f}", delta_color="off")
+
+                    # ---- PLS-POLE Base Plate dialog export (display only)
+                    orient7 = detect_pls_orientation(p7)
+                    angs7 = pls_bolt_angles(int(ro["n"]), orient7)
+                    txt_ang7 = pls_angles_text(angs7)
+                    bpp7 = _gst7(p7, 'base_plate_properties')
+                    fy_xml7 = _gf7(bpp7[0], 'steel_yield_stress') if bpp7 else None
+                    if fy_xml7 is not None and abs(float(fy_xml7) - float(ro["Fy"])) > 1e-9:
+                        st.warning(f"The uploaded XML's base plate steel yield stress is "
+                                   f"{fmt_pls_value(fy_xml7)} ksi, but this option "
+                                   f"(plate t = {fmt_pls_value(ro['t'])} in) requires "
+                                   f"Fy = {fmt_pls_value(ro['Fy'])} ksi. Enter "
+                                   f"{fmt_pls_value(ro['Fy'])} ksi in PLS-POLE for this option.")
+                    st.markdown("**PLS-POLE Base Plate input**")
+                    pls_rows7 = [
+                        ("Plate shape", 0),
+                        ("Plate diameter (in)", out["od"]),
+                        ("Hole shape", 0),
+                        ("Hole diameter (in)", out["hole"]),
+                        ("Plate thickness (in)", ro["t"]),
+                        ("Steel density (lbs/ft^3)", RHO_PCF),
+                        ("Bolt pattern diameter (in)", out["bc"]),
+                        ("Bolt diameter (in)", RR.bolt_d),
+                        ("Plate steel yield stress (ksi)", ro["Fy"]),
+                        ("Bend line length override (in)", 0),
+                        ("Number of bolts (info only, not a PLS field)", int(ro["n"])),
+                    ]
+                    st.dataframe(pd.DataFrame([{"Field": f_, "Value": fmt_pls_value(v_)}
+                                               for f_, v_ in pls_rows7]),
+                                 width="stretch", hide_index=True)
+                    st.caption("Enter these values in PLS-POLE > Base Plate dialog. Thickness must be "
+                               "entered (not 0) so PLS checks this plate instead of designing one.")
+                    st.markdown("**Bolt angles (single quadrant, PLS-POLE format)**")
+                    st.caption("Orientation detected from the uploaded XML: "
+                               + ("on-axis — a bolt sits at 0°." if orient7 == "on_axis" else
+                                  "straddle — bolts are offset half a spacing from the axes."))
+                    st.dataframe(pd.DataFrame({
+                        "#": list(range(1, len(angs7) + 1)),
+                        "Bolt X Coord.": [0] * len(angs7),
+                        "Bolt Y Coord.": [0] * len(angs7),
+                        "Bolt Angle (deg)": angs7}),
+                        width="stretch", hide_index=True)
+                    st.markdown("Copy angles → paste into PLS 'Bolt Angle (deg)' column starting at row 1")
+                    st.code(txt_ang7, language=None)
+                    st.markdown("Copy full rows → paste with row 1 / Bolt X Coord. cell selected")
+                    # text_area, not st.code: a textarea's value is the exact
+                    # string, so the tab separators survive copy-paste.
+                    st.text_area("Copy full rows", pls_angle_rows_text(angs7),
+                                 height=min(60 + 22 * len(angs7), 460),
+                                 label_visibility="collapsed")
+                    st.download_button("Bolt angles (TXT)", txt_ang7,
+                                       file_name=f"bolt_angles_{int(ro['n'])}b.txt")
+                    st.caption("PLS-POLE mirrors these into all 4 quadrants: N/4+1 angles (on-axis) or "
+                               "N/4 angles (straddle) reproduce N bolts. Clear any leftover rows in PLS "
+                               "before pasting.")
+
                     st.markdown("**Workbook rule check**")
                     st.dataframe(pd.DataFrame(workbook_rules_check(D_af, bot.thickness, ro["n"], out["bc"],
                                                                    out["od"], out["hole"], RR)),
@@ -1513,7 +1571,20 @@ Re-verify the chosen layout in PLS-POLE.
                         "anchor bolt wt (lb)": round(ro["bolt_wt"]) if ro["bolt_wt"] else None,
                         "usage target %": float(S.bp_target), "axial cap (k)": float(S.bp_tcap),
                         "f'c (ksi)": float(S.bp_fc), "projection (in)": float(S.bp_proj)}])
-                    st.download_button("Selected option (CSV)", exp.to_csv(index=False),
+                    import io as _io, csv as _csv
+                    _buf = _io.StringIO()
+                    _w = _csv.writer(_buf, lineterminator="\n")
+                    _w.writerow([])
+                    _w.writerow(["PLS-POLE Base Plate input"])
+                    _w.writerow(["Field", "Value"])
+                    for f_, v_ in pls_rows7:
+                        _w.writerow([f_, fmt_pls_value(v_)])
+                    _w.writerow([])
+                    _w.writerow(["Bolt angles (deg) - single quadrant"])
+                    for a_ in angs7:
+                        _w.writerow([fmt_pls_value(a_)])
+                    st.download_button("Selected option (CSV)",
+                                       exp.to_csv(index=False) + _buf.getvalue(),
                                        file_name=f"base_plate_{ro['n']}b_{ro['t']:g}in.csv")
 
                 # ---- baseline: compare with the PLS-POLE design
