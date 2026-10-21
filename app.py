@@ -7,19 +7,20 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 st.set_page_config(page_title="Pole Shaft Optimizer", layout="wide")
-st.title("🗼 Pole Shaft Optimizer")
-st.caption("ASCE 48-19 | 12-sided tapered polygonal steel poles")
+import style_b
+style_b.apply("Pole Shaft Optimizer", "ASCE 48-19 · 12-sided tapered polygonal steel poles")
+SB = style_b.tokens()          # Style B colours for the active light / dark mode
 
 # ── SIDEBAR: upload + analysis settings ────────────────────────────────────
 with st.sidebar:
-    st.header("📂 Upload XML")
+    st.header("Upload XML")
     uploaded = st.file_uploader("PLS-POLE XML export", type=["xml"])
     if uploaded:
         st.success(f"Loaded: {uploaded.name}")
     else:
         st.info("Upload a file to begin.")
 
-    st.header("⚙️ Analysis settings")
+    st.header("Analysis settings")
     br_label = st.radio("Inside bend radius", ["4.5t (matches PLS-POLE)", "4.0t (ASCE 48-19 cap)"],
                         index=0, help="Used for flat width w and w/t -> local buckling Fa.")
     BR = 4.5 if br_label.startswith("4.5") else 4.0
@@ -31,6 +32,8 @@ with st.sidebar:
                         "conservative by +0.1% to +0.6% mean on tip deflection vs PLS-POLE "
                         "(003, 014, 015). outer = female only (+0.4% to +1.9%); "
                         "inner = male only (slightly unconservative); sum = both walls (too stiff).")
+
+    st.caption("Light / dark mode: top-right menu ⋮ → Settings → Theme.")
 
 # ── Cached helpers ─────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
@@ -119,9 +122,9 @@ def gov_index(cases, name):
 tmp_path = save_xml(uploaded.getvalue()) if uploaded else None
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-    "📂 1 · XML Parser", "📐 2 · Geometry & Weight", "💨 3 · Loads",
-    "🔩 4 · Strength Check", "📏 5 · Deflection", "⚖️ 6 · Optimizer",
-    "🧱 7 · Base Plate",
+    "1 · XML Parser", "2 · Geometry & Weight", "3 · Loads",
+    "4 · Strength Check", "5 · Deflection", "6 · Optimizer",
+    "7 · Base Plate",
 ])
 
 # Base plate / anchor bolt settings: edited in Tab 7, also used by the
@@ -264,24 +267,24 @@ with tab2:
             cA, cB = st.columns(2)
             with cA:
                 fig, ax = plt.subplots(figsize=(6, 5))
-                ax.plot([s['D'] for s in secs2], hgts2, color='steelblue', linewidth=2)
-                ax.axhline(0, color='brown', linestyle='--', linewidth=1, label='Ground line')
+                ax.plot([s['D'] for s in secs2], hgts2, color=SB['primary'], linewidth=2)
+                ax.axhline(0, color=SB['text_muted'], linestyle='--', linewidth=1, label='Ground line')
                 first = True
                 for tb in lay2:
                     if tb['lap'] > 0:
                         ax.axhspan(spec2.groundline_rel - tb['end'],
                                    spec2.groundline_rel - (tb['end'] - tb['lap']),
-                                   color='orange', alpha=0.3, label='Slip lap' if first else None)
+                                   color=SB['warning'], alpha=0.3, label='Slip lap' if first else None)
                         first = False
                 ax.set_xlabel("Flat-to-flat diameter (in)"); ax.set_ylabel("Height AGL (ft)")
                 ax.set_title("Diameter vs height"); ax.legend(); ax.grid(True, alpha=0.3)
                 st.pyplot(fig); plt.close(fig)
             with cB:
                 fig2, ax2 = plt.subplots(figsize=(6, 5))
-                ax2.plot([s['w_over_t'] for s in secs2], hgts2, color='darkorange', linewidth=2)
-                ax2.axvline(limits.max_wt, color='red', linestyle='--', linewidth=1,
+                ax2.plot([s['w_over_t'] for s in secs2], hgts2, color=SB['warning'], linewidth=2)
+                ax2.axvline(limits.max_wt, color=SB['danger'], linestyle='--', linewidth=1,
                             label=f'Limit = {limits.max_wt}')
-                ax2.axhline(0, color='brown', linestyle='--', linewidth=1, label='Ground line')
+                ax2.axhline(0, color=SB['text_muted'], linestyle='--', linewidth=1, label='Ground line')
                 ax2.set_xlabel(f"w/t (BR = {BR}t)"); ax2.set_ylabel("Height AGL (ft)")
                 ax2.set_title("w/t vs height"); ax2.legend(); ax2.grid(True, alpha=0.3)
                 st.pyplot(fig2); plt.close(fig2)
@@ -369,10 +372,10 @@ with tab3:
             above3 = [e for e in m3.elements if e.above_ground]
             hts3 = [m3.z_of(e.s_mid) for e in above3]
             fig3, (a3, b3) = plt.subplots(1, 2, figsize=(10, 5))
-            a3.barh(hts3, [e.fy * 1000 for e in above3], height=0.2, color='steelblue')
+            a3.barh(hts3, [e.fy * 1000 for e in above3], height=0.2, color=SB['primary'])
             a3.set_xlabel("Transverse wind per element (lb)"); a3.set_ylabel("Height AGL (ft)")
             a3.set_title("Shaft transverse wind"); a3.grid(True, alpha=0.3)
-            b3.barh(hts3, [e.fz * 1000 for e in above3], height=0.2, color='darkorange')
+            b3.barh(hts3, [e.fz * 1000 for e in above3], height=0.2, color=SB['warning'])
             b3.set_xlabel("Vertical load per element (lb)"); b3.set_ylabel("Height AGL (ft)")
             b3.set_title("Shaft self-weight + ice"); b3.grid(True, alpha=0.3)
             plt.tight_layout(); st.pyplot(fig3); plt.close(fig3)
@@ -505,12 +508,12 @@ with tab4:
                 cA, cB = st.columns(2)
                 with cA:
                     fig4a, ax4a = plt.subplots(figsize=(6, 6))
-                    ax4a.plot(valid4['calc usage %'], valid4['ht AGL (ft)'], color='steelblue',
+                    ax4a.plot(valid4['calc usage %'], valid4['ht AGL (ft)'], color=SB['primary'],
                               linewidth=2, label='Engine')
                     if 'PLS usage %' in valid4 and valid4['PLS usage %'].notna().any():
-                        ax4a.plot(valid4['PLS usage %'], valid4['ht AGL (ft)'], color='darkorange',
+                        ax4a.plot(valid4['PLS usage %'], valid4['ht AGL (ft)'], color=SB['warning'],
                                   linewidth=1.5, linestyle='--', label='PLS-POLE')
-                    ax4a.axvline(100, color='red', linestyle='--', linewidth=1, label='100%')
+                    ax4a.axvline(100, color=SB['danger'], linestyle='--', linewidth=1, label='100%')
                     ax4a.set_xlabel("Usage (%)"); ax4a.set_ylabel("Height AGL (ft)")
                     ax4a.set_title("Usage vs height"); ax4a.legend(); ax4a.grid(True, alpha=0.3)
                     st.pyplot(fig4a); plt.close(fig4a)
@@ -519,7 +522,7 @@ with tab4:
                     for col in ('p_a', 'm_s', 'v_q'):
                         ax4b.plot(valid4[col].abs(), valid4['ht AGL (ft)'], label=f'|{col}|', linewidth=1.5)
                     ax4b.plot(valid4['res'], valid4['ht AGL (ft)'], label='res', linewidth=2,
-                              color='black', linestyle='--')
+                              color=SB['text'], linestyle='--')
                     ax4b.set_xlabel("Stress at governing point (ksi)"); ax4b.set_ylabel("Height AGL (ft)")
                     ax4b.set_title("Stress components"); ax4b.legend(fontsize=8); ax4b.grid(True, alpha=0.3)
                     st.pyplot(fig4b); plt.close(fig4b)
@@ -534,8 +537,8 @@ with tab4:
                     s_[3].metric("Points > ±2", f"{int((d['diff (pts)'].abs() > 2).sum())}")
                     fig4c, ax4c = plt.subplots(figsize=(7, 4))
                     ax4c.barh(d['ht AGL (ft)'], d['diff (pts)'], height=0.6,
-                              color=['red' if abs(v) > 2 else 'steelblue' for v in d['diff (pts)']])
-                    ax4c.axvline(0, color='black', linewidth=0.8)
+                              color=[SB['danger'] if abs(v) > 2 else SB['primary'] for v in d['diff (pts)']])
+                    ax4c.axvline(0, color=SB['text'], linewidth=0.8)
                     ax4c.set_xlabel("Engine − PLS (usage pts)"); ax4c.set_ylabel("Height AGL (ft)")
                     ax4c.grid(True, alpha=0.3)
                     st.pyplot(fig4c); plt.close(fig4c)
@@ -621,25 +624,25 @@ with tab5:
             with cA:
                 fig5, ax5 = plt.subplots(figsize=(6, 6))
                 h = gl5 - r5.s
-                ax5.plot(r5.y * 12, h, color='steelblue', linewidth=2, label='Engine transverse')
+                ax5.plot(r5.y * 12, h, color=SB['primary'], linewidth=2, label='Engine transverse')
                 if np.any(np.abs(r5.x) > 1e-4):
-                    ax5.plot(r5.x * 12, h, color='seagreen', linewidth=1.5, label='Engine longitudinal')
+                    ax5.plot(r5.x * 12, h, color=SB['success'], linewidth=1.5, label='Engine longitudinal')
                 if pls5:
                     ax5.scatter([_gf5(q, 'trans_defl') for q in pls5],
                                 [gl5 - _gf5(q, 'rel_dist') for q in pls5],
-                                s=12, color='darkorange', zorder=3, label='PLS-POLE transverse')
-                ax5.axvline(0, color='gray', linewidth=0.5)
+                                s=12, color=SB['warning'], zorder=3, label='PLS-POLE transverse')
+                ax5.axvline(0, color=SB['text_muted'], linewidth=0.5)
                 ax5.set_xlabel("Deflection (in)"); ax5.set_ylabel("Height AGL (ft)")
                 ax5.set_title("Deflected shape"); ax5.legend(fontsize=8); ax5.grid(True, alpha=0.3)
                 st.pyplot(fig5); plt.close(fig5)
             with cB:
                 fig6, ax6 = plt.subplots(figsize=(6, 6))
-                ax6.plot(r5.Mx, gl5 - r5.s, color='steelblue', linewidth=2, label='Engine 2nd-order Mx')
-                ax6.plot(fo5.Mx, gl5 - fo5.s, color='gray', linewidth=1, linestyle=':', label='1st-order Mx')
+                ax6.plot(r5.Mx, gl5 - r5.s, color=SB['primary'], linewidth=2, label='Engine 2nd-order Mx')
+                ax6.plot(fo5.Mx, gl5 - fo5.s, color=SB['text_muted'], linewidth=1, linestyle=':', label='1st-order Mx')
                 if pls5:
                     ax6.scatter([_gf5(q, 'trans_mom_local_mx') for q in pls5],
                                 [gl5 - _gf5(q, 'rel_dist') for q in pls5],
-                                s=12, color='darkorange', zorder=3, label='PLS-POLE Mx')
+                                s=12, color=SB['warning'], zorder=3, label='PLS-POLE Mx')
                 ax6.set_xlabel("Mx (ft-k)"); ax6.set_ylabel("Height AGL (ft)")
                 ax6.set_title("Transverse moment: P-delta effect"); ax6.legend(fontsize=8)
                 ax6.grid(True, alpha=0.3)
@@ -757,7 +760,7 @@ with tab6:
                 slip_clearance=xml_lap_gap(_gst6(p6, 'steel_tubes_properties')),
                 min_slip_above_gl=0.0, fy=65.0,
                 strength_target=100.0, defl_target=100.0, tolerance_pct=0.0,
-                long_tube_threshold_pct=2.0, tie_band_pct=1.0,
+                fab_penalty_pct=2.0,
                 n_alternates=10, log_all=False, time_limit_min=15.0, max_evals=200000,
                 bp_on=True)
             for k, v in DEF.items():
@@ -852,17 +855,26 @@ with tab6:
                     "one automatically. *Example (003, 110 ft, base plate): L = 40 ft has no 2-segment "
                     "solution, so the result is 3 segments, 53 / 27 / 40 ft at 13,379 lb versus 12,798 lb "
                     "unconstrained.*")
-                st.number_input("Long-tube weight threshold X (%)", key="o_long_tube_threshold_pct",
-                                min_value=0.0, step=0.5)
+                st.number_input("Minimum saving to accept a fabrication penalty "
+                                "(extra segment or 57–60 ft tube) X (%)", key="o_fab_penalty_pct",
+                                min_value=0.0, max_value=50.0, step=0.5)
                 st.caption(
-                    "**What is X?** Tubes longer than the *normal max* (57 ft default) are harder to "
-                    "fabricate, galvanize and ship. For each segment count, the optimizer compares the "
-                    "lightest design that uses only standard lengths with the lightest design that uses a "
-                    "long tube. The long-tube design is accepted only if it is **more than X% lighter**. "
-                    "X = 0 → always take the lighter design; a large X → long tubes are effectively "
-                    "never used when a standard layout exists. *Example (003): standard 57/57 ft = 14,199 lb, "
-                    "long-tube 54/60 ft = 12,784 lb → 10.0% saving → accepted when X < 10.0.* "
-                    "If no standard-length layout is possible at a segment count, long tubes are allowed there.")
+                    "**How tube lengths and segments are chosen.** The lightest passing pole wins, with "
+                    "two fabrication penalties that must each be paid for by a saving of **at least X%**:  \n"
+                    "• **Extra segment** — a design with more segments is used only if it is ≥ X% lighter "
+                    "(per extra segment) than the best design with fewer segments. This also applies when a "
+                    "57–60 ft tube is what removes a segment: fewer segments wins unless the extra segment "
+                    "saves X%.  \n"
+                    "• **57–60 ft tube** (longer than the *normal max*) — at the same segment count, used "
+                    "only if ≥ X% lighter than the best design *without* a long tube.  \n"
+                    "Non-bottom tubes **shorter than the preferred length** carry no penalty: the search "
+                    "places splices wherever they save steel, and a short-tube layout replaces the best "
+                    "standard layout (preferred → normal max) whenever it is lighter by more than the "
+                    f"engine's weight accuracy ({_opt_mod.NOISE_PCT:g}%). The seed XML's own tube lengths "
+                    "are always tried as well.  \n"
+                    "*Example (illustrative), X = 2%: 3 segments standard 48,750 lb, short-tube 47,680 lb, "
+                    "with a 59 ft tube 47,300 lb, 4 segments 46,900 lb → the short-tube design wins: the "
+                    "59 ft tube saves only 0.8% over it and the 4th segment only 1.6%.*")
                 r = st.columns(3)
                 r[0].radio("Default joint type", ["slip", "flange"], key="o_joint_default", horizontal=True)
                 r[1].text_input("Force FLANGE at joints (1 = lowest)", key="o_flange_at",
@@ -883,7 +895,7 @@ with tab6:
                                   help="Clearance from the ground line up to the BOTTOM OF THE LAP of the lowest slip joint (the female tube's lower end), not the joint itself. Default 0 = no requirement. Example (011): joint at 15.0 ft AGL, lap bottom at 7.5 ft AGL.")
 
                 st.markdown("**Acceptance and ranking**")
-                r = st.columns(4)
+                r = st.columns(3)
                 r[0].selectbox("Strength usage target (%)", [100.0, 95.0, 90.0, 85.0], key="o_strength_target")
                 r[1].number_input("Deflection target (% of XML limit)", key="o_defl_target",
                                   min_value=0.0, step=5.0,
@@ -896,9 +908,6 @@ with tab6:
                                        "target × (1 + tolerance/100). E.g. target 100%, tolerance 1 → 101%; "
                                        "target 90%, tolerance 1 → 90.9%. Designs accepted above target are "
                                        "flagged 'within tolerance'.")
-                r[3].number_input("Tie band (% of lightest)", key="o_tie_band_pct", step=0.5,
-                                  help="Designs within this % of the lightest are ranked by: fewer segments → "
-                                       "preferred lengths → weight → lower usage.")
                 r = st.columns(3)
                 r[0].number_input("Alternates to report", key="o_n_alternates", min_value=0, max_value=30, step=1)
                 r[1].number_input("Search time limit (min)", key="o_time_limit_min", min_value=1.0, step=1.0,
@@ -997,8 +1006,8 @@ with tab6:
                     slip_clearance=2.0 * S.o_slip_clearance, min_slip_above_gl=S.o_min_slip_above_gl,
                     strength_target=float(S.o_strength_target), defl_target=S.o_defl_target,
                     tolerance_pct=float(S.o_tolerance_pct),
-                    long_tube_threshold_pct=float(S.o_long_tube_threshold_pct),
-                    tie_band_pct=S.o_tie_band_pct, n_alternates=int(S.o_n_alternates),
+                    fab_penalty_pct=float(S.o_fab_penalty_pct),
+                    n_alternates=int(S.o_n_alternates),
                     shear_mode=SHEAR, lap_stiffness=LAP,
                     time_limit_s=float(S.o_time_limit_min) * 60.0,
                     max_evaluations=int(S.o_max_evals),
@@ -1139,16 +1148,21 @@ with tab6:
                         f"{sum(t['length'] for t in win.spec.layout()):.2f} ft against "
                         f"{sum(t['length'] for t in lay6):.2f} ft for the baseline; the difference is lap "
                         "steel, which changes with the number and size of the slip joints.")
-                    st.caption(f"Taper {win.spec.taper:.5f} in/ft (derived). "
-                               f"{res.get('winner_variants', 0)} other tube-length arrangements of this "
-                               "design also pass; the one shown ranks best on section lengths.")
+                    lc_w = length_class(win.spec, C6)
+                    st.caption(f"Taper {win.spec.taper:.5f} in/ft (derived). Length class: "
+                               f"**{lc_w['label']}**. {res.get('winner_variants', 0)} other tube-length "
+                               "arrangements of the same diameters and walls also pass; the one shown ranks "
+                               "first under the fabrication rules.")
 
-                # ---- long-tube rule table
-                st.subheader(f"Long-tube rule (X = {C6.long_tube_threshold_pct:g}%)")
-                st.dataframe(pd.DataFrame(res["long_table"]), width="stretch", hide_index=True)
-                st.caption("For each segment count: lightest verified design with standard lengths only vs "
-                           "lightest with a tube over the normal max. Long tubes are used only when the "
-                           "saving exceeds X.")
+                # ---- fabrication rule table
+                st.subheader(f"Fabrication rules (X = {C6.fab_penalty_pct:g}%)")
+                _ft = pd.DataFrame(res.get("fab_table", []))
+                st.dataframe(_ft.astype(object).where(_ft.notna(), "—"), width="stretch", hide_index=True)
+                st.caption("Per segment count: lightest verified standard, short-tube and long-tube design, "
+                           f"and which one is used (short-tube needs ≥ {_opt_mod.NOISE_PCT:g}% saving over "
+                           "standard, long tube ≥ X% over the best design without one). The last column "
+                           "applies the extra-segment rule (≥ X% per extra segment). — = no verified design of that "
+                           "class (none possible, or outside the search margin of the best design).")
 
                 # ---- design scatter
                 kept = sorted(res.get("kept", []), key=lambda e: e.weight)
@@ -1163,7 +1177,7 @@ with tab6:
                         labels[id(e)] = f"Other · {e.weight:,.0f} lb · D {e.design.tip}/{e.design.base}"
                     pickable = ranked + others
                     for e in res.get("dropped", []):
-                        labels[id(e)] = f"Excluded (long-tube rule) · {e.weight:,.0f} lb"
+                        labels[id(e)] = f"Not used (long-tube rule) · {e.weight:,.0f} lb"
                     pickable += list(res.get("dropped", []))
                     st.session_state["opt_pickable"] = dict(
                         file=tmp_path, items=[(labels[id(e_)], e_) for e_ in pickable])
@@ -1171,16 +1185,13 @@ with tab6:
 
                     st.subheader("Design map — every fully verified design")
                     fig = go.Figure()
-                    wmin, band = res["wmin"], res["band"]
-                    fig.add_hrect(y0=wmin, y1=band, fillcolor="green", opacity=0.08, line_width=0,
-                                  annotation_text=f"tie band ({C6.tie_band_pct:g}%)",
-                                  annotation_position="top left")
-                    fig.add_vline(x=C6.strength_target, line_dash="dash", line_color="red",
+                    fig.add_vline(x=C6.strength_target, line_dash="dash", line_color=SB["danger"],
                                   annotation_text="target")
                     if C6.tolerance_pct > 0:
-                        fig.add_vline(x=C6.strength_limit(), line_dash="dot", line_color="orange",
+                        fig.add_vline(x=C6.strength_limit(), line_dash="dot", line_color=SB["warning"],
                                       annotation_text="tolerance")
-                    colors = {1: "#8c564b", 2: "#1f77b4", 3: "#2ca02c", 4: "#9467bd", 5: "#ff7f0e", 6: "#17becf"}
+                    colors = {1: "#8399a3", 2: "#3d98d3", 3: "#1ea23c", 4: "#e08d17", 5: "#ed352c", 6: "#6cb8e6"}
+                    symbols = {"standard": "circle", "short": "triangle-up", "long": "circle-open"}
                     idx_of = {id(e): i for i, e in enumerate(pickable)}
                     def hover(e):
                         s_ = summarize(e, C6)
@@ -1192,25 +1203,26 @@ with tab6:
                                 + (f"{e.defl:.2f}%" if e.defl is not None else "—")
                                 + f"<br>governs: {e.gov_check}")
                     for n_ in sorted({e.design.n for e in kept}):
-                        for lng in (False, True):
+                        for lcls in ("standard", "short", "long"):
                             grp = [e for e in kept if e.design.n == n_ and
-                                   (length_class(e.spec, C6)['n_special'] > 0) == lng]
+                                   length_class(e.spec, C6)['cls'] == lcls]
                             if not grp:
                                 continue
+                            lng = lcls == "long"
                             fig.add_trace(go.Scatter(
                                 x=[gu(e) for e in grp], y=[e.weight for e in grp], mode="markers",
-                                name=f"{n_} seg" + (" · long tube" if lng else ""),
-                                marker=dict(size=9, color=colors.get(n_, "gray"),
-                                            symbol="circle-open" if lng else "circle",
-                                            line=dict(width=2 if lng else 0.5, color=colors.get(n_, "gray"))),
+                                name=f"{n_} seg · {lcls}",
+                                marker=dict(size=9, color=colors.get(n_, SB["text_muted"]),
+                                            symbol=symbols[lcls],
+                                            line=dict(width=2 if lng else 0.5, color=colors.get(n_, SB["text_muted"]))),
                                 customdata=[idx_of[id(e)] for e in grp],
                                 hovertext=[hover(e) for e in grp], hoverinfo="text"))
                     drp = list(res.get("dropped", []))
                     if drp:
                         fig.add_trace(go.Scatter(
                             x=[gu(e) for e in drp], y=[e.weight for e in drp], mode="markers",
-                            name="excluded (long-tube rule)",
-                            marker=dict(size=8, color="lightgray", symbol="x"),
+                            name="not used (long-tube rule)",
+                            marker=dict(size=8, color="#8399a3", symbol="x"),
                             customdata=[idx_of[id(e)] for e in drp],
                             hovertext=[hover(e) for e in drp], hoverinfo="text"))
                     fig.add_trace(go.Scatter(
@@ -1219,12 +1231,12 @@ with tab6:
                         showlegend=False, hoverinfo="skip"))
                     fig.add_trace(go.Scatter(
                         x=[gu(win)], y=[win.weight], mode="markers+text", name="Recommended",
-                        marker=dict(size=18, color="gold", symbol="diamond", line=dict(width=1.5, color="black")),
+                        marker=dict(size=18, color="#f26526", symbol="diamond", line=dict(width=1.5, color=SB["text"])),
                         text=["1"], textposition="middle center", customdata=[idx_of[id(win)]],
                         hovertext=[hover(win)], hoverinfo="text"))
                     fig.add_trace(go.Scatter(
                         x=[max(B['strength'], B['defl'] or 0)], y=[B['weight']], mode="markers",
-                        name="Baseline (XML)", marker=dict(size=18, color="red", symbol="star"),
+                        name="Baseline (XML)", marker=dict(size=18, color=SB["danger"], symbol="star"),
                         hovertext=[f"<b>Baseline</b><br>{B['weight']:,.0f} lb<br>strength "
                                    f"{B['strength']:.2f}%"], hoverinfo="text"))
                     fig.update_layout(height=520, xaxis_title="Governing usage (%) — max of strength and deflection",
@@ -1232,8 +1244,9 @@ with tab6:
                                       margin=dict(t=30))
                     ev = st.plotly_chart(fig, on_select="rerun", selection_mode="points", key="design_map",
                                          width="stretch")
-                    st.caption("Click a point to load it into the detail check below. Hollow markers use a "
-                               "long tube; grey × were verified but excluded by the long-tube rule.")
+                    st.caption("Click a point to load it into the detail check below. Circles: standard "
+                               "lengths; triangles: a tube shorter than the preferred length; hollow circles: "
+                               "a 57–60 ft tube; grey ×: verified but not used under the long-tube rule.")
                     try:
                         pts = ev.selection.points if ev and ev.selection else []
                     except Exception:
@@ -1255,19 +1268,20 @@ with tab6:
                                                   name="best screened weight",
                                                   hovertext=[f"{h_[2]:,.0f} lb at eval {h_[0]} ({h_[1]:.0f} s)"
                                                              for h_ in hist] + [""], hoverinfo="text"))
-                        fig2.add_hline(y=B['weight'], line_dash="dash", line_color="red",
+                        fig2.add_hline(y=B['weight'], line_dash="dash", line_color=SB["danger"],
                                        annotation_text="baseline")
-                        fig2.add_hline(y=win.weight, line_dash="dot", line_color="green",
+                        fig2.add_hline(y=win.weight, line_dash="dot", line_color=SB["success"],
                                        annotation_text="recommended (verified)")
                         fig2.update_layout(height=360, xaxis_title="Screening evaluations",
                                            yaxis_title="Shaft weight (lb)", margin=dict(t=30), showlegend=False)
                         st.plotly_chart(fig2, width="stretch")
                         st.caption("Best weight found during screening (5 governing cases) vs work done. "
-                                   "The recommended design can differ slightly: ranking applies the tie band "
-                                   "and length preferences, and only fully verified designs are eligible.")
+                                   "The recommended design can differ: ranking applies the fabrication rules "
+                                   "(extra segment, long tube, short-tube noise tolerance), and only fully "
+                                   "verified designs are eligible.")
 
                     # ---- alternates table
-                    st.subheader(f"Next {len(res['alternates'])} designs and why they rank lower")
+                    st.subheader(f"Next {len(res['alternates'])} designs and why they are not recommended")
                     st.dataframe(pd.DataFrame([{
                         "rank": i + 2, **{k_: v_ for k_, v_ in summarize(a, C6).items() if k_ != "gov case"},
                         "Δ weight (lb)": round(a.weight - win.weight),
@@ -1311,8 +1325,8 @@ with tab6:
                     for c, x in rr.cases.items():
                         ax7.plot([q['usage'] for q in x.rows], [q['height_agl'] for q in x.rows],
                                  linewidth=2 if c == cg.case else 0.6,
-                                 color='steelblue' if c == cg.case else 'lightgray')
-                    ax7.axvline(C6.strength_target, color='red', linestyle='--', linewidth=1)
+                                 color=SB['primary'] if c == cg.case else SB['text_muted'])
+                    ax7.axvline(C6.strength_target, color=SB['danger'], linestyle='--', linewidth=1)
                     ax7.set_xlabel("Strength usage (%)"); ax7.set_ylabel("Height AGL (ft)")
                     ax7.set_title(f"All load cases (bold = {cg.case[:35]})"); ax7.grid(True, alpha=0.3)
                     st.pyplot(fig7); plt.close(fig7)

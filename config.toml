@@ -1,0 +1,88 @@
+# Style B - Light Command Center (design system), light + dark.
+# Colour values are the Style B tokens (tokens.json). Light is the sampled
+# reference; dark is the system's derived mode. Switch modes in the app's
+# top-right menu > Settings > Theme (Light / Dark / System).
+# Fonts: Roboto / Roboto Mono are the system's visual match (unconfirmed).
+
+[theme]
+font = "Roboto:https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700;800&display=swap"
+codeFont = "'Roboto Mono':https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;500&display=swap"
+headingFontWeights = [800, 700, 700, 700, 600, 600]
+baseRadius = "6px"
+buttonRadius = "4px"
+showWidgetBorder = true
+showSidebarBorder = false
+
+[theme.light]
+primaryColor = "#3d98d3"                  # primary
+backgroundColor = "#f5f8f9"               # bg-page
+secondaryBackgroundColor = "#ecf5fb"      # bg-thead (inputs, insets)
+textColor = "#041e2b"                     # text-primary
+borderColor = "#cdd6da"                   # border
+dataframeBorderColor = "#e6ebed"          # divider
+dataframeHeaderBackgroundColor = "#ecf5fb"  # bg-thead
+linkColor = "#3789be"                     # link
+codeBackgroundColor = "#ffffff"           # bg-surface
+redColor = "#ed352c"                      # danger
+orangeColor = "#e08d17"                   # warning
+yellowColor = "#e08d17"
+greenColor = "#1ea23c"                    # success
+blueColor = "#3d98d3"                     # info
+grayColor = "#8399a3"                     # text-muted
+redBackgroundColor = "#fdecea"            # danger-bg
+orangeBackgroundColor = "#fffbe9"         # warning-bg
+yellowBackgroundColor = "#fffbe9"
+greenBackgroundColor = "#e8f6ec"          # success-bg
+blueBackgroundColor = "#ecf5fb"           # info-bg
+grayBackgroundColor = "#fafafa"           # neutral-bg
+redTextColor = "#c62a22"                  # danger-text
+orangeTextColor = "#a86a00"               # warning-text: token #eca917 is FLAGGED 2.0:1; #a86a00 is the system's suggested 4.5:1 value
+yellowTextColor = "#a86a00"
+greenTextColor = "#1a8a34"                # success-text
+blueTextColor = "#2b7fb8"                 # info-text
+grayTextColor = "#2e4a57"                 # text-secondary
+chartCategoricalColors = ["#3d98d3", "#073247", "#1ea23c", "#e08d17", "#ed352c", "#8399a3"]
+
+[theme.light.sidebar]
+backgroundColor = "#073247"               # bg-nav (navy bar)
+secondaryBackgroundColor = "#0d3d55"      # nav-border
+textColor = "#e8f0f4"
+borderColor = "#2a4a5c"
+primaryColor = "#3d98d3"
+
+[theme.dark]
+primaryColor = "#3d98d3"
+backgroundColor = "#0b1720"
+secondaryBackgroundColor = "#10232e"
+textColor = "#e8f0f4"
+borderColor = "#23404f"
+dataframeBorderColor = "#1d3646"
+dataframeHeaderBackgroundColor = "#133247"
+linkColor = "#6cb8e6"
+codeBackgroundColor = "#0d1d27"
+redColor = "#f2605a"
+orangeColor = "#f0a23a"
+yellowColor = "#f0a23a"
+greenColor = "#34c058"
+blueColor = "#6cb8e6"
+grayColor = "#8fa7b2"
+redBackgroundColor = "#3d1b1b"
+orangeBackgroundColor = "#3a2a10"
+yellowBackgroundColor = "#3a2a10"
+greenBackgroundColor = "#12331f"
+blueBackgroundColor = "#12324a"
+grayBackgroundColor = "#10232e"
+redTextColor = "#f8918b"
+orangeTextColor = "#f5b955"
+yellowTextColor = "#f5b955"
+greenTextColor = "#5fd27e"
+blueTextColor = "#8ccbef"
+grayTextColor = "#b8c9d1"
+chartCategoricalColors = ["#6cb8e6", "#c3d3df", "#34c058", "#f0a23a", "#f2605a", "#8fa7b2"]
+
+[theme.dark.sidebar]
+backgroundColor = "#073247"
+secondaryBackgroundColor = "#0d3d55"
+textColor = "#e8f0f4"
+borderColor = "#2a4a5c"
+primaryColor = "#3d98d3"

@@ -1,4 +1,4 @@
-streamlit
+streamlit>=1.50   # [theme.light]/[theme.dark] config, st.context.theme
 numpy
 lxml
 matplotlib

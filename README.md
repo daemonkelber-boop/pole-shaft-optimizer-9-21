@@ -33,7 +33,9 @@ Upload a PLS-POLE XML export and the app will:
 ## Architecture
 
 ```
-app.py                   Streamlit UI — all six tabs
+app.py                   Streamlit UI — all seven tabs
+style_b.py               Style B (Light Command Center) layer: header, pill tabs, cards, chart colours
+.streamlit/config.toml   Style B light + dark theme (switch: ⋮ menu → Settings → Theme)
 pls_pole_xml_parser.py   XML parser (windows-1252 encoding, per-load-case tables)
 geometry.py              PoleSpec, Segment, section properties, fabrication limits
 loads.py                 Baseline (from XML) + LoadModel (recomputed per candidate)
@@ -89,6 +91,16 @@ Export your model from PLS-POLE via **File → Export XML**. The parser expects 
 | **Inside bend radius** | 4.5t (matches PLS-POLE) / 4.0t (ASCE 48-19 cap) | Affects flat width `w` and the w/t → local buckling Fa calculation |
 | **Shear for stress check** | resultant / transverse_only | Transverse-only reproduces PLS-POLE on tangent structures; resultant is conservative |
 | **Slip-joint lap stiffness** | midpoint / outer / inner / sum | Controls which tube wall carries bending stiffness through a lap. `midpoint` (default) is conservative by +0.1% to +0.6% vs PLS-POLE tip deflection |
+
+---
+
+## Tube lengths, segments and ranking (optimizer)
+
+- **Splice heights are searched directly.** Besides the standard-length grid, every (tip, base) pair gets the layout whose splice heights minimise estimated weight (dynamic programme over 0.5 ft splice positions, non-bottom tubes from the min tube length to the normal max). The seed XML's own tube lengths are also tried at every pair. All candidates are then sized, screened and fully verified as before.
+- **Lightest passing design wins**, subject to one setting, *Minimum saving to accept a fabrication penalty (extra segment or 57–60 ft tube)*, X = 2% by default, test ≥ X%:
+  - an extra segment is used only if it saves ≥ X% per extra segment over the best design with fewer segments (also when a 57–60 ft tube is what removes the segment);
+  - a 57–60 ft tube is used only if it saves ≥ X% over the best design at the same segment count *without* a long tube.
+- Non-bottom tubes shorter than the preferred length carry no penalty; a short-tube layout replaces the best standard layout when it is ≥ 0.5% lighter (fixed noise tolerance, `optimizer.NOISE_PCT`).
 
 ---
 
