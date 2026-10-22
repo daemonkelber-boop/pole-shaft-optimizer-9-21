@@ -121,10 +121,297 @@ def gov_index(cases, name):
 
 tmp_path = save_xml(uploaded.getvalue()) if uploaded else None
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+
+# ── Pole diagram helper ────────────────────────────────────────────────────
+def _draw_pole_diagram(spec, base, SB):
+    """Return a matplotlib figure replicating the PLS-POLE elevation view."""
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+
+    lay = spec.layout()
+    gl_rd = spec.groundline_rel
+    agl   = spec.agl_height
+
+    WX = 1.6  # width exaggeration (matches PLS-POLE standard view)
+
+    # ---- coordinate helpers ------------------------------------------------
+    def y(rd):
+        """Height AGL for a rel_dist (0 at GL, + is up)."""
+        return gl_rd - rd
+
+    def face_half(y_agl):
+        """Half the exaggerated flat-to-flat width at a given AGL height (ft)."""
+        rd = gl_rd - y_agl
+        rd = max(0.0, min(rd, spec.total_length))
+        return spec.diameter_at(rd) / 24.0 * WX
+
+    # ---- 12-sided polygon edge projections ---------------------------------
+    # Circumradius factor relative to D_ff/2 = 1.0
+    R12 = 1.0 / (2.0 * np.cos(np.radians(15.0)))
+    # Four visible column lines per half (right side), normalised to D_ff/2
+    v_factors = sorted([
+        R12 * np.sin(np.radians(15)),   # ≈ 0.268
+        R12 * np.sin(np.radians(45)),   # ≈ 0.732
+        R12 * np.sin(np.radians(75)),   # ≈ 0.998
+        R12,                             # ≈ 1.035  (vertex = outermost)
+    ])
+
+    # ---- attachment points (sorted tip → base) -----------------------------
+    attach_pts = sorted(base.attach.values(), key=lambda ap: ap.s_pole)
+    # Filter to above-ground attachments only
+    attach_pts = [ap for ap in attach_pts if ap.s_pole <= gl_rd + 0.01]
+
+    # ---- figure geometry ---------------------------------------------------
+    max_arm = max((ap.extra_horz for ap in attach_pts), default=0.0)
+    x_pole_half_base = spec.base_diameter / 24.0 * WX
+    arm_pad    = 5.0
+    right_pad  = 18.0
+    x_left  = -(x_pole_half_base + max_arm + arm_pad + 10.0)
+    x_right =   x_pole_half_base + right_pad
+
+    y_top = agl + 2.5
+    y_bot = -spec.embedment - 1.5
+
+    span_x = x_right - x_left
+    span_y = y_top - y_bot
+    fig_w = min(18, max(12, span_x * 0.40))
+    fig_h = min(22, max(14, span_y * 0.30))
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.set_xlim(x_left, x_right)
+    ax.set_ylim(y_bot, y_top)
+    ax.set_aspect('equal')
+    ax.axis('off')
+    fig.patch.set_facecolor(SB.get('bg', '#FFFFFF'))
+
+    # ---- colours -----------------------------------------------------------
+    C_POLE  = '#8B2500'   # dark red  – pole frame
+    C_DIM   = '#1565C0'   # blue      – right-side dimension chain
+    C_CHAIN = '#C62828'   # red       – left attachment chain
+    C_LAP   = '#FFE082'   # amber     – lap fill
+    C_ARM   = '#546E7A'   # blue-grey – arms
+    C_DOT   = '#1565C0'   # blue      – wire attachment dot
+
+    lw_outer = 1.5
+    lw_inner = 0.8
+
+    # ========================================================================
+    # 1. POLE WIREFRAME
+    # ========================================================================
+    for tb in lay:
+        y_t = y(tb['start'])
+        y_b = y(tb['end'])
+        n   = max(4, int(abs(y_t - y_b) * 6))
+        y_ln = np.linspace(y_t, y_b, n)
+        rds  = gl_rd - y_ln
+        for side in (-1.0, 1.0):
+            for k, vf in enumerate(v_factors):
+                D_vals = np.array([spec.diameter_at(float(r)) for r in rds])
+                x_vals = side * vf * D_vals / 24.0 * WX
+                lw = lw_outer if k == len(v_factors) - 1 else lw_inner
+                ax.plot(x_vals, y_ln, color=C_POLE, linewidth=lw, alpha=0.9,
+                        solid_capstyle='butt', zorder=3)
+
+    # ========================================================================
+    # 2. SLIP-LAP SHADED BANDS
+    # ========================================================================
+    for tb in lay:
+        if tb['lap'] <= 0:
+            continue
+        y_lap_t = y(tb['end'] - tb['lap'])
+        y_lap_b = y(tb['end'])
+        n_b = 60
+        y_band = np.linspace(y_lap_b, y_lap_t, n_b)
+        x_r = np.array([face_half(yi) for yi in y_band])
+        ax.fill_betweenx(y_band, -x_r, x_r, color=C_LAP, alpha=0.65, zorder=2)
+        # dashed boundary lines
+        for yi in (y_lap_t, y_lap_b):
+            xf = face_half(yi) * 1.55
+            ax.plot([-xf, xf], [yi, yi], color=C_DIM, lw=0.9,
+                    linestyle='--', alpha=0.7, zorder=4)
+
+    # ========================================================================
+    # 3. GROUND LINE
+    # ========================================================================
+    gl_w = x_pole_half_base * 2.2
+    ax.plot([-gl_w, gl_w], [0, 0], color='#212121', linewidth=2.0, zorder=5)
+    ax.text(x_left * 0.15, -0.4, 'GL', fontsize=8, ha='right', va='top',
+            color='#212121')
+
+    # ========================================================================
+    # 4. ARMS
+    # ========================================================================
+    for ap in attach_pts:
+        yi = y(ap.s_pole)
+        xf = face_half(yi)
+        arm_len = ap.extra_horz
+        if arm_len <= 0:
+            continue
+        x_wire = -(xf + arm_len)   # arms extend left
+        # bracket on pole face
+        bh = 0.35
+        ax.plot([-xf, -xf], [yi - bh, yi + bh], color=C_POLE, lw=2.5, zorder=5)
+        # arm line (tapered hint: 3 sub-lines)
+        for dx in (0.0, 0.15, -0.15):
+            ax.plot([x_wire, -xf], [yi + dx * 0.5, yi + dx * 0.5],
+                    color=C_ARM, lw=0.9, alpha=0.8, zorder=4)
+        # wire attachment dot
+        ax.plot(x_wire, yi, 'o', color=C_DOT, ms=5, zorder=6)
+        # label: arm length (above arm midpoint)
+        ax.text((x_wire + (-xf)) / 2, yi + 0.6, f'{arm_len:.2f}',
+                fontsize=7.5, ha='center', va='bottom', color=C_ARM)
+        # label: attachment name (left of dot)
+        ax.text(x_wire - 0.4, yi, ap.label, fontsize=8,
+                ha='right', va='center', color=C_CHAIN,
+                fontweight='bold')
+
+    # ========================================================================
+    # 5. LEFT ATTACHMENT CHAIN  (red, from tip downward)
+    # ========================================================================
+    chain_x = x_left + 4.0
+    # vertical spine
+    ax.plot([chain_x, chain_x], [0.0, agl], color=C_CHAIN, lw=1.0, zorder=4)
+    # tip mark
+    ax.plot(chain_x, agl, 's', color=C_CHAIN, ms=4, zorder=5)
+
+    prev_y_c = agl
+    prev_rd  = 0.0
+    for ap in attach_pts:
+        yi = y(ap.s_pole)
+        # x-mark
+        dm = 0.28
+        ax.plot([chain_x - dm, chain_x + dm], [yi + dm, yi - dm],
+                color=C_CHAIN, lw=1.5, zorder=5)
+        ax.plot([chain_x - dm, chain_x + dm], [yi - dm, yi + dm],
+                color=C_CHAIN, lw=1.5, zorder=5)
+        # connector line from chain to pole-face label
+        ax.annotate('', xy=(-face_half(yi) * 0.9, yi),
+                    xytext=(chain_x + 0.3, yi),
+                    arrowprops=dict(arrowstyle='-', color=C_CHAIN,
+                                   lw=0.6, linestyle='dotted'))
+        # gap dimension
+        gap = ap.s_pole - prev_rd
+        mid = (yi + prev_y_c) / 2
+        ax.text(chain_x - 1.3, mid, f'{gap:.2f}',
+                fontsize=8, ha='right', va='center', color=C_CHAIN)
+        prev_y_c = yi
+        prev_rd  = ap.s_pole
+
+    # gap from last attachment to GL
+    if attach_pts:
+        last_ap = attach_pts[-1]
+        gap_gl  = gl_rd - last_ap.s_pole
+        mid_gl  = y(last_ap.s_pole) / 2.0
+        ax.text(chain_x - 1.3, mid_gl, f'{gap_gl:.2f}',
+                fontsize=8, ha='right', va='center', color=C_CHAIN)
+    # GL mark on chain
+    ax.plot(chain_x, 0, 's', color=C_CHAIN, ms=4, zorder=5)
+
+    # ========================================================================
+    # 6. RIGHT DIMENSION CHAIN  (blue: inner clear-spans + laps + overall)
+    # ========================================================================
+    # Column x positions
+    x_c1 = x_pole_half_base + 2.5   # inner clear-spans + laps
+    x_c2 = x_c1 + 5.5               # tube fabricated lengths
+    x_c3 = x_c2 + 5.0               # overall
+
+    def _dim_arrow(ax, x, y0, y1, color, lw=0.9):
+        ax.annotate('', xy=(x, y1), xytext=(x, y0),
+                    arrowprops=dict(arrowstyle='<->', color=color, lw=lw,
+                                   mutation_scale=8))
+
+    # ---- inner column: clear spans and laps --------------------------------
+    # Boundaries: tip, clear spans between laps, laps, GL
+    boundaries = [agl]   # start at tip
+    for tb in lay:
+        if tb['lap'] > 0:
+            boundaries.append(y(tb['end'] - tb['lap']))  # lap top
+            boundaries.append(y(tb['end']))               # lap bottom
+    boundaries.append(0.0)   # GL
+    boundaries.sort(reverse=True)   # top → bottom
+
+    for i in range(len(boundaries) - 1):
+        y1 = boundaries[i]
+        y0 = boundaries[i + 1]
+        if abs(y1 - y0) < 0.05:
+            continue
+        span = y1 - y0
+        _dim_arrow(ax, x_c1, y0, y1, C_DIM)
+        # lap or clear?
+        is_lap = any(
+            abs(y(tb['end'] - tb['lap']) - y1) < 0.05 and
+            abs(y(tb['end']) - y0) < 0.05
+            for tb in lay if tb['lap'] > 0
+        )
+        txt = f'lap {span:.2f}' if is_lap else f'{span:.2f}'
+        fc  = '#E65100' if is_lap else C_DIM
+        ax.text(x_c1 + 0.6, (y0 + y1) / 2, txt,
+                fontsize=7.5, ha='left', va='center', color=fc)
+
+    # ---- middle column: per-tube fabricated lengths ------------------------
+    for tb in lay:
+        y_t = y(tb['start'])
+        y_b = y(tb['end'])
+        # clamp to above-ground
+        if y_t < 0 and y_b < 0:
+            continue
+        y_t_vis = min(y_t, agl)
+        y_b_vis = max(y_b, -spec.embedment)
+        _dim_arrow(ax, x_c2, y_b_vis, y_t_vis, C_DIM, lw=0.9)
+        ax.text(x_c2 + 0.6, (y_t_vis + y_b_vis) / 2,
+                f'tube {tb["tube_no"]} · {tb["length"]:.2f}',
+                fontsize=7.5, ha='left', va='center', color=C_DIM, rotation=90,
+                rotation_mode='anchor')
+
+    # ---- outer column: overall AGL height ----------------------------------
+    _dim_arrow(ax, x_c3, 0.0, agl, C_DIM, lw=1.1)
+    ax.text(x_c3 + 0.7, agl / 2, f'{agl:.2f}',
+            fontsize=8, ha='left', va='center', color=C_DIM, rotation=90,
+            rotation_mode='anchor')
+
+    # ========================================================================
+    # 7. LABELS: tip, base, tube thicknesses
+    # ========================================================================
+    # Tip diameter
+    tip_xf = face_half(agl)
+    ax.text(0, agl + 0.8, f'tip {spec.tip_diameter:.2f} in',
+            fontsize=8, ha='center', va='bottom', color='#212121')
+
+    # Base diameter + embedment
+    base_note = 'no embedment' if spec.embedment == 0 else f'{spec.embedment:.2f} ft embed'
+    ax.text(0, y_bot + 0.2,
+            f'base {spec.base_diameter:.2f} in · {base_note}',
+            fontsize=8, ha='center', va='bottom', color='#212121')
+
+    # Wall thickness labels (one per tube, right side just outside pole)
+    for tb in lay:
+        y_mid = (y(tb['start']) + y(tb['end'])) / 2.0
+        y_mid = max(0.1, min(y_mid, agl - 0.1))
+        xf = face_half(y_mid) * 1.12
+        ax.text(xf + 0.25, y_mid, f't {tb["thickness"]:.3f}',
+                fontsize=7.5, ha='left', va='center', color='#424242')
+
+    # ========================================================================
+    # 8. LEGEND
+    # ========================================================================
+    leg_y = y_bot + 0.6
+    patches = [
+        mpatches.Patch(facecolor=C_CHAIN, label='attachment chain from top (ft)'),
+        mpatches.Patch(facecolor=C_DIM,   label='sections, laps and overall (ft)'),
+        mpatches.Patch(facecolor=C_LAP,   label='slip lap'),
+        mpatches.Patch(facecolor=C_DOT,   label='wire attachment', linestyle='none'),
+    ]
+    ax.legend(handles=patches, loc='lower center', bbox_to_anchor=(0.5, -0.04),
+              ncol=4, fontsize=7, framealpha=0.4, edgecolor='none')
+
+    plt.tight_layout(pad=0.5)
+    return fig
+
+
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "1 · XML Parser", "2 · Geometry & Weight", "3 · Loads",
     "4 · Strength Check", "5 · Deflection", "6 · Optimizer",
-    "7 · Base Plate",
+    "7 · Base Plate", "8 · Pole View",
 ])
 
 # Base plate / anchor bolt settings: edited in Tab 7, also used by the
@@ -1619,5 +1906,21 @@ Re-verify the chosen layout in PLS-POLE.
                             width="stretch", hide_index=True)
                         st.caption("Plate usage here uses this tool's base reactions; compare with PLS-POLE's "
                                    "'Summary of Base Plate Usages' to confirm the match.")
+        except Exception as e:
+            show_error(e)
+
+# ── TAB 8: POLE VIEW ──────────────────────────────────────────────────────
+with tab8:
+    st.header("Pole View")
+    if not tmp_path:
+        st.info("Upload a PLS-POLE XML file in the sidebar to begin.")
+    else:
+        try:
+            p8    = load_parsed(tmp_path)
+            spec8 = build_spec(p8)
+            base8 = load_baseline(tmp_path)
+            fig8  = _draw_pole_diagram(spec8, base8, SB)
+            st.pyplot(fig8, use_container_width=False)
+            plt.close(fig8)
         except Exception as e:
             show_error(e)

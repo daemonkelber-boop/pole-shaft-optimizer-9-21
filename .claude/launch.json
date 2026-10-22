@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "pole-optimizer",
+      "runtimeExecutable": "C:\\Users\\jaine\\anaconda3\\envs\\poleopt\\python.exe",
+      "runtimeArgs": ["-m", "streamlit", "run", "app.py", "--server.port", "8501"],
+      "port": 8501
+    }
+  ]
+}
