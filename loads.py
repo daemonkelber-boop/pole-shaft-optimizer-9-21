@@ -52,6 +52,8 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+
 from geometry import PoleSpec, dodecagon_section_properties, STEEL_DENSITY_PCF
 from pls_pole_xml_parser import (parse_pls_pole_xml, get_field, get_single_table,
                                  get_load_case_instances)
@@ -340,3 +342,85 @@ def first_order_forces(model: LoadModel, s0: float) -> dict:
             My += p.Fx * h + p.Fz * p.dx
             T += p.Fx * p.dy - p.Fy * p.dx
     return dict(P=P, Vx=Vx, Vy=Vy, Mx=Mx, My=My, T=T)
+
+
+# --------------------------------------------------------------------------
+# Vectorised first-order moment envelope (optimizer bound)
+# --------------------------------------------------------------------------
+
+class FirstOrderEnvelope:
+    """max over `cases` of hypot(Mx, My) from first_order_forces(), at given
+    stations, for any candidate geometry -- the same numbers as
+    build_load_model(spec, base, c, ds) + first_order_forces() per station,
+    without building the element / point-load objects.
+
+    The point loads (forces, elevations, offsets beyond the pole face) are
+    geometry independent and prepared once per case here. Per candidate only
+    the shaft wind (projected width = mean outside D of the tubes present,
+    as in build_load_model) and the face-to-centreline lever arm D(s)/24 of
+    each attachment are recomputed. Element weight / ice only add axial
+    load, so they do not enter the first-order moments."""
+
+    def __init__(self, base: Baseline, cases: List[str], ds: float = 2.0):
+        self.ds = ds
+        self.cases = []
+        for c in cases:
+            lc = base.load_cases[c]
+            k = base.cd_pole * lc.wind_area_factor / 12.0 / 1000.0   # kips / (in ft) / psf
+            rows = [(base.attach[lab], Fx, Fy, Fz)
+                    for lab, Fx, Fy, Fz in base.attach_loads.get(c, [])]
+            rows += [(a, 0.0, 0.0, w * lc.dlf) for _, a, w in base.davit_weights]
+            pts = np.array([(a.s_pole, a.extra_horz, a.dz, math.radians(a.azimuth),
+                             Fx, Fy, Fz) for a, Fx, Fy, Fz in rows], dtype=float).reshape(-1, 7)
+            self.cases.append(dict(qy=lc.q_trans * k, qx=lc.q_long * k, ice2=2.0 * lc.ice_t,
+                                   s=pts[:, 0], eh=pts[:, 1], dz=pts[:, 2],
+                                   sin=np.sin(pts[:, 3]), cos=np.cos(pts[:, 3]),
+                                   Fx=pts[:, 4], Fy=pts[:, 5], Fz=pts[:, 6]))
+
+    @staticmethod
+    def _diameter_at(lay: List[dict], taper: float, s: np.ndarray, tol: float = 1e-6) -> np.ndarray:
+        """PoleSpec.diameter_at() for an array: the female (lowest tube_no)
+        tube inside a lap; off the pole, the nearest tube end."""
+        D = np.full(s.shape, np.nan)
+        for tb in lay:
+            hit = np.isnan(D) & (tb['start'] - tol <= s) & (s <= tb['end'] + tol)
+            D = np.where(hit, tb['d_top'] + taper * (s - tb['start']), D)
+        for i in np.nonzero(np.isnan(D))[0]:
+            tb = min(lay, key=lambda t: min(abs(t['start'] - s[i]), abs(t['end'] - s[i])))
+            D[i] = tb['d_top'] + taper * (s[i] - tb['start'])
+        return D
+
+    def __call__(self, spec: PoleSpec, stations: np.ndarray) -> np.ndarray:
+        lay = spec.layout()
+        H = sum(tb['length'] for tb in lay) - sum(tb['lap'] for tb in lay)
+        gl = H - spec.embedment
+        n = max(1, int(round(H / self.ds)))
+        ds = H / n
+        i = np.arange(n)
+        s_top, s_bot = i * ds, (i + 1) * ds
+        sm = 0.5 * (s_top + s_bot)
+        Dsum = np.zeros(n)
+        cnt = np.zeros(n)
+        for tb in lay:                                   # tubes_at(), tol 1e-9
+            on = (tb['start'] - 1e-9 <= sm) & (sm <= tb['end'] + 1e-9)
+            Dsum += np.where(on, tb['d_top'] + spec.taper * (sm - tb['start']), 0.0)
+            cnt += on
+        D_w = Dsum / cnt
+        above = sm < gl
+        st = np.asarray(stations, dtype=float)
+        # lever of every element about every station (0 below the station)
+        Le = np.where(s_bot[None, :] <= st[:, None] + 1e-9, st[:, None] - sm[None, :], 0.0)
+        env = np.zeros(st.shape)
+        for c in self.cases:
+            width = np.where(above, (D_w + c['ice2']) * ds, 0.0)
+            Mx = Le @ (c['qy'] * width)
+            My = Le @ (c['qx'] * width)
+            if c['s'].size:
+                r = self._diameter_at(lay, spec.taper, c['s']) / 24.0 + c['eh']
+                dx, dy = r * c['sin'], r * c['cos']
+                on = c['s'][None, :] <= st[:, None] + 1e-9
+                h = np.where(on, st[:, None] - c['s'][None, :] + c['dz'][None, :], 0.0)
+                Mx = Mx + h @ c['Fy'] + on @ (c['Fz'] * dy)
+                My = My + h @ c['Fx'] + on @ (c['Fz'] * dx)
+            env = np.maximum(env, np.hypot(Mx, My))
+        return env

@@ -62,7 +62,7 @@ _trapz = getattr(np, 'trapezoid', None) or getattr(np, 'trapz')
 from geometry import (PoleSpec, Segment, w_over_t, GAUGES, SLIP_CLEARANCE_IN,
                       slip_joint_lap)
 from weight import pole_weight
-from loads import Baseline, build_load_model, first_order_forces
+from loads import Baseline, FirstOrderEnvelope
 from strength import evaluate_candidate, CandidateResult
 from baseplate import BasePlateRules, size_baseplate, base_reactions
 
@@ -358,7 +358,11 @@ class Optimizer:
         self.log_all = log_all
         self.log: List[dict] = []
         self.cache: Dict[tuple, Optional[Evaluated]] = {}
+        #: failure reason of every cached None, so size() can keep thickening
+        #: when it meets a design it has already evaluated
+        self._fail_why: Dict[tuple, str] = {}
         self._env_cache: Dict[tuple, tuple] = {}
+        self._env_fn: Dict[str, FirstOrderEnvelope] = {}
         self.n_evals = 0
         self.found: Dict[tuple, Evaluated] = {}
         self.t0 = time.time()
@@ -630,22 +634,24 @@ class Optimizer:
         Point (wire / arm) loads are geometry independent; only the shaft
         wind changes with diameter. First-order moments are always smaller
         than the second-order ones the real check uses, so this keeps the
-        bound optimistic (a true lower bound on the steel required)."""
-        key = (id(spec), None if case_s is None else len(case_s))
+        bound optimistic (a true lower bound on the steel required).
+
+        Cached on the geometry itself, never on id(spec): the specs passed
+        in are temporaries, and a freed spec's id is reused by the next one."""
+        which = 'all' if case_s is None else 'first'
+        key = (which, spec.tip_diameter, spec.taper, spec.embedment, spec.slip_clearance,
+               spec.lap_factor, spec.lap_round,
+               tuple((s.length, s.thickness, s.joint_type, s.lap_override,
+                      s.top_diameter_override) for s in spec.segments))
         cache = self._env_cache.get(key)
         if cache is None:
-            cases = [self.screen_cases[0]] if case_s is not None else self.screen_cases
+            fn = self._env_fn.get(which)
+            if fn is None:
+                cases = [self.screen_cases[0]] if case_s is not None else self.screen_cases
+                fn = self._env_fn[which] = FirstOrderEnvelope(self.base, cases, ds=2.0)
             grid = np.linspace(0, spec.groundline_rel, 60)
-            env = np.zeros_like(grid)
-            for c in cases:
-                m = build_load_model(spec, self.base, c, ds=2.0)
-                vals = []
-                for s0 in grid:
-                    f = first_order_forces(m, s0)
-                    vals.append(math.hypot(f['Mx'], f['My']))
-                env = np.maximum(env, np.array(vals))
-            cache = (grid, env)
-            if len(self._env_cache) > 64:
+            cache = (grid, fn(spec, grid))
+            if len(self._env_cache) > 256:
                 self._env_cache.clear()
             self._env_cache[key] = cache
         grid, env = cache
@@ -752,15 +758,17 @@ class Optimizer:
         key = (d.tip, d.base, d.uppers, d.ts, full)
         if key in self.cache:
             e = self.cache[key]
-            return e, ('' if e else 'cached fail')
+            return e, ('' if e else self._fail_why.get(key, 'cached fail'))
         spec, why = make_spec(d, self.H, self.emb, self.C, self.G)
         if spec is None:
             self.cache[key] = None
+            self._fail_why[key] = why
             self._log(d, None, why)
             return None, why
         C = self.C
         if self.bp_on and not self.bp_feasible(spec.base_diameter, spec.segments[-1].thickness):
             self.cache[key] = None
+            self._fail_why[key] = 'baseplate'
             self._log(d, None, 'base plate infeasible')
             return None, 'baseplate'
         self.n_evals += 1
@@ -782,7 +790,8 @@ class Optimizer:
         self.cache[key] = e if ok else None
         self._log(d, e, 'pass' if ok else 'fail', r)
         if not ok:
-            return None, self._fail_reason(r)
+            self._fail_why[key] = self._fail_reason(r)
+            return None, self._fail_why[key]
         return e, ''
 
     def _fail_reason(self, r: CandidateResult) -> str:
